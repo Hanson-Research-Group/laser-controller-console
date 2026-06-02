@@ -17,7 +17,10 @@ def build_exe():
         '--onefile',
         '--noconsole',
         '--name=LDC3908_ModularLaserDiodeControllerSoftware',
-        f'--add-data={ctk_path}{os.pathsep}customtkinter/'
+        f'--add-data={ctk_path}{os.pathsep}customtkinter/',
+        f'--add-data=src/laser_controller_icon.png{os.pathsep}src/',
+        f'--add-data=src/laser_controller_icon.ico{os.pathsep}src/',
+        '--icon=src/laser_controller_icon.ico'
     ]
 
     print(f"Running PyInstaller with arguments: {params}")

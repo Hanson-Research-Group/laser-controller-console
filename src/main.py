@@ -17,14 +17,33 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 # Set appearance mode and color theme
-ctk.set_appearance_mode("Dark")
+ctk.set_appearance_mode("Light")
 ctk.set_default_color_theme("blue")
+
+def resolve_path(relative_path):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    try:
+        base_path = sys._MEIPASS
+    except AttributeError:
+        # main.py is in src/, so parent directory of os.path.dirname(__file__) is root
+        base_path = os.path.abspath(os.path.dirname(os.path.dirname(__file__)))
+    return os.path.join(base_path, relative_path)
 
 class LEDIndicator(tk.Canvas):
     """A custom Tkinter widget to draw a beautiful, smooth status LED."""
     def __init__(self, parent, size=18, color="#cccccc", **kwargs):
-        # Default dark mode frame background is #2b2b2b, let's match that or transparent
-        super().__init__(parent, width=size, height=size, bg="#2b2b2b", highlightthickness=0, **kwargs)
+        # Dynamically resolve background color based on parent CustomTkinter frame color
+        bg_color = "#ffffff"
+        try:
+            parent_fg = parent.cget("fg_color")
+            if isinstance(parent_fg, (list, tuple)):
+                mode = ctk.get_appearance_mode().lower()
+                bg_color = parent_fg[0] if mode == "light" else parent_fg[1]
+            elif parent_fg:
+                bg_color = parent_fg
+        except:
+            pass
+        super().__init__(parent, width=size, height=size, bg=bg_color, highlightthickness=0, **kwargs)
         self.size = size
         self.color = color
         self.draw_circle()
@@ -46,9 +65,20 @@ class LDCControllerApp(ctk.CTk):
         super().__init__()
 
         # --- Configure Main Window ---
-        self.title("LDC-3908 Modular Laser Diode Controller Software")
+        self.title("LDC-3908 Modular Laser Diode Controller Software v0.2.0")
         self.geometry("1450x850")
         self.minsize(1200, 700)
+        
+        # Set window icon
+        try:
+            icon_ico = resolve_path("src/laser_controller_icon.ico")
+            icon_png = resolve_path("src/laser_controller_icon.png")
+            if os.path.exists(icon_ico):
+                self.iconbitmap(icon_ico)
+            elif os.path.exists(icon_png):
+                self.iconphoto(False, tk.PhotoImage(file=icon_png))
+        except:
+            pass
 
         # --- Shared Application State Variables ---
         self.ser = None
@@ -140,10 +170,10 @@ class LDCControllerApp(ctk.CTk):
         chan_panel.grid_columnconfigure(0, weight=1)
 
         # Title Label
-        ctk.CTkLabel(chan_panel, text="Individual Channel Configuration & Live Telemetry", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        ctk.CTkLabel(chan_panel, text="Individual Channel Configuration & Live Telemetry - v0.2.0", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
 
         # Dynamic Grid Container
-        self.grid_container = ctk.CTkFrame(chan_panel, fg_color="#2b2b2b")
+        self.grid_container = ctk.CTkFrame(chan_panel, fg_color=("#ebebeb", "#2b2b2b"))
         self.grid_container.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
         
         # Headers definitions
@@ -518,7 +548,7 @@ class LDCControllerApp(ctk.CTk):
 
             self.is_simulated = False
             self.status_label.configure(text="Status: Disconnected", text_color="#ff5555")
-            self.btn_connect.configure(text="Connect", fg_color=["#3a3a3a", "#3a3a3a"])
+            self.btn_connect.configure(text="Connect", fg_color=None)
             self.com_dropdown.configure(state="normal")
             self.btn_scan.configure(state="disabled")
             self.btn_clear_faults.configure(state="disabled")
@@ -817,14 +847,14 @@ class LDCControllerApp(ctk.CTk):
             ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
             set_entry_val(ch["live_tec"], "ON")
         else:
-            ch["live_tec"].configure(fg_color="#3a3a3a", text_color="#888888")
+            ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
             set_entry_val(ch["live_tec"], "OFF")
 
         if las_out == 1:
             ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
             set_entry_val(ch["live_las"], "ON")
         else:
-            ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
+            ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
             set_entry_val(ch["live_las"], "OFF")
 
         # Update LED colors and status text
@@ -869,9 +899,9 @@ class LDCControllerApp(ctk.CTk):
         ch["enable_var"].set(False)
         ch["laser_label"].configure(state="disabled")
         
-        ch["live_tec"].configure(fg_color="#3a3a3a", text_color="#888888")
+        ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
         set_entry_val(ch["live_tec"], "OFF")
-        ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
+        ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
         set_entry_val(ch["live_las"], "OFF")
 
         ch["status"].configure(text=reason, text_color="#666666")
@@ -1001,7 +1031,7 @@ class LDCControllerApp(ctk.CTk):
                 ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
                 set_entry_val(ch["live_tec"], "ON")
             else:
-                ch["live_tec"].configure(fg_color="#3a3a3a", text_color="#888888")
+                ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                 set_entry_val(ch["live_tec"], "OFF")
 
         if las_stat is not None:
@@ -1009,7 +1039,7 @@ class LDCControllerApp(ctk.CTk):
                 ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
                 set_entry_val(ch["live_las"], "ON")
             else:
-                ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
+                ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                 set_entry_val(ch["live_las"], "OFF")
 
     # ----------------------------------------------------
@@ -1641,14 +1671,14 @@ class LDCControllerApp(ctk.CTk):
                 ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
                 set_entry_val(ch["live_tec"], "ON")
             else:
-                ch["live_tec"].configure(fg_color="#3a3a3a", text_color="#888888")
+                ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                 set_entry_val(ch["live_tec"], "OFF")
         elif type_str == "LAS":
             if state_str == "ON":
                 ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
                 set_entry_val(ch["live_las"], "ON")
             else:
-                ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
+                ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                 set_entry_val(ch["live_las"], "OFF")
 
     def update_eta(self):
