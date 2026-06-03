@@ -255,13 +255,13 @@ class LDCControllerApp(ctk.CTk):
 
             # Live TEC state field (read-only entry)
             ent_live_tec = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center",
-                                       fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+                                       fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
             set_entry_val(ent_live_tec, "OFF")
             ent_live_tec.grid(row=row, column=5, padx=3, pady=3)
 
             # Live LAS state field (read-only entry)
             ent_live_las = ctk.CTkEntry(self.grid_container, width=65, state="disabled", font=("Segoe UI", 10, "bold"), justify="center",
-                                       fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+                                       fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
             set_entry_val(ent_live_las, "OFF")
             ent_live_las.grid(row=row, column=6, padx=3, pady=3)
 
@@ -954,17 +954,17 @@ class LDCControllerApp(ctk.CTk):
 
         # Set live output status boxes visually
         if tec_out == 1:
-            ch["live_tec"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
+            ch["live_tec"].configure(fg_color="#2e7d32", text_color="white")
             set_entry_val(ch["live_tec"], "ON")
         else:
-            ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+            ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
             set_entry_val(ch["live_tec"], "OFF")
 
         if las_out == 1:
-            ch["live_las"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
+            ch["live_las"].configure(fg_color="#2e7d32", text_color="white")
             set_entry_val(ch["live_las"], "ON")
         else:
-            ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+            ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
             set_entry_val(ch["live_las"], "OFF")
 
         # Update LED colors and status text
@@ -1010,9 +1010,9 @@ class LDCControllerApp(ctk.CTk):
         ch["enable_var"].set(False)
         ch["laser_label"].configure(state="disabled")
         
-        ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+        ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
         set_entry_val(ch["live_tec"], "OFF")
-        ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+        ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
         set_entry_val(ch["live_las"], "OFF")
 
         ch["status"].configure(text=reason, text_color="#78909c")
@@ -1156,18 +1156,18 @@ class LDCControllerApp(ctk.CTk):
 
             if tec_stat is not None:
                 if tec_stat == 1:
-                    ch["live_tec"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
+                    ch["live_tec"].configure(fg_color="#2e7d32", text_color="white")
                     set_entry_val(ch["live_tec"], "ON")
                 else:
-                    ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+                    ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                     set_entry_val(ch["live_tec"], "OFF")
 
             if las_stat is not None:
                 if las_stat == 1:
-                    ch["live_las"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
+                    ch["live_las"].configure(fg_color="#2e7d32", text_color="white")
                     set_entry_val(ch["live_las"], "ON")
                 else:
-                    ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+                    ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                     set_entry_val(ch["live_las"], "OFF")
         except tk.TclError:
             pass
@@ -1244,7 +1244,7 @@ class LDCControllerApp(ctk.CTk):
 
     def update_channel_emergency_off(self, idx):
         ch = self.ch_ui[idx]
-        ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888", text_color_disabled="#888888")
+        ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
         set_entry_val(ch["live_las"], "OFF")
         ch["status"].configure(text="EMERGENCY OFF: Current Cut", text_color="#c62828")
         ch["led"].set_color("#c62828")
@@ -1858,17 +1858,17 @@ class LDCControllerApp(ctk.CTk):
         ch = self.ch_ui[idx]
         if type_str == "TEC":
             if state_str == "ON":
-                ch["live_tec"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
+                ch["live_tec"].configure(fg_color="#2e7d32", text_color="white")
                 set_entry_val(ch["live_tec"], "ON")
             else:
-                ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+                ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                 set_entry_val(ch["live_tec"], "OFF")
         elif type_str == "LAS":
             if state_str == "ON":
-                ch["live_las"].configure(fg_color="#2e7d32", text_color="white", text_color_disabled="white")
+                ch["live_las"].configure(fg_color="#2e7d32", text_color="white")
                 set_entry_val(ch["live_las"], "ON")
             else:
-                ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"), text_color_disabled=("black", "#888888"))
+                ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
                 set_entry_val(ch["live_las"], "OFF")
 
     def update_eta(self):
