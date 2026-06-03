@@ -97,6 +97,7 @@ class LDCControllerApp(ctk.CTk):
         # Telemetry control
         self.telemetry_thread = None
         self.telemetry_active = False
+        self.telemetry_fail_count = 0
 
         # --- Simulation Mock State ---
         # 1=Installed/Good, 2=Installed/NoLaser(T<0), 0=Empty Slot
@@ -141,24 +142,31 @@ class LDCControllerApp(ctk.CTk):
         self.avail_ports.append("Demo Simulator")
         
         self.com_dropdown = ctk.CTkOptionMenu(top_frame, values=self.avail_ports, width=150)
-        self.com_dropdown.grid(row=0, column=1, padx=5, pady=10)
-        if "Demo Simulator" in self.avail_ports:
+        self.com_dropdown.grid(row=0, column=1, padx=(5, 0), pady=10)
+        
+        self.btn_refresh = ctk.CTkButton(top_frame, text="↻", width=30, command=self.refresh_ports)
+        self.btn_refresh.grid(row=0, column=2, padx=(2, 5), pady=10)
+
+        # P1 #5: Prefer real hardware port first (matches MATLAB behaviour);
+        # only fall back to Demo Simulator when no physical ports exist.
+        real_ports = [p for p in self.avail_ports if p != "Demo Simulator"]
+        if real_ports:
+            self.com_dropdown.set(real_ports[0])
+        else:
             self.com_dropdown.set("Demo Simulator")
-        elif len(self.avail_ports) > 1:
-            self.com_dropdown.set(self.avail_ports[0])
 
         self.btn_connect = ctk.CTkButton(top_frame, text="Connect", width=100, command=self.connect_serial)
-        self.btn_connect.grid(row=0, column=2, padx=5, pady=10)
+        self.btn_connect.grid(row=0, column=3, padx=5, pady=10)
 
         self.btn_scan = ctk.CTkButton(top_frame, text="Scan Channels", width=120, state="disabled", command=self.start_channel_scan)
-        self.btn_scan.grid(row=0, column=3, padx=5, pady=10)
+        self.btn_scan.grid(row=0, column=4, padx=5, pady=10)
 
-        self.btn_clear_faults = ctk.CTkButton(top_frame, text="Clear Faults", width=100, fg_color="transparent", text_color="#ff5555", 
-                                               hover_color="#331111", state="disabled", command=self.clear_faults)
-        self.btn_clear_faults.grid(row=0, column=4, padx=5, pady=10)
+        self.btn_clear_faults = ctk.CTkButton(top_frame, text="Clear Faults", width=100, fg_color="transparent", text_color="#c62828", 
+                                               hover_color="#ffebee", state="disabled", command=self.clear_faults)
+        self.btn_clear_faults.grid(row=0, column=5, padx=5, pady=10)
 
-        self.status_label = ctk.CTkLabel(top_frame, text="Status: Disconnected", text_color="#ff5555", font=("Segoe UI", 12, "bold"))
-        self.status_label.grid(row=0, column=6, padx=(10, 20), pady=10, sticky="e")
+        self.status_label = ctk.CTkLabel(top_frame, text="Status: Disconnected", text_color="#c62828", font=("Segoe UI", 12, "bold"))
+        self.status_label.grid(row=0, column=7, padx=(10, 20), pady=10, sticky="e")
 
         # ----------------------------------------------------
         # 2. MIDDLE PANEL: CHANNELS GRID
@@ -171,7 +179,7 @@ class LDCControllerApp(ctk.CTk):
         chan_panel.grid_columnconfigure(0, weight=1)
 
         # Title Label
-        ctk.CTkLabel(chan_panel, text="Individual Channel Configuration & Live Telemetry - v0.2.0", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        ctk.CTkLabel(chan_panel, text="Individual Channel Configuration & Live Telemetry", font=("Segoe UI", 12, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
 
         # Dynamic Grid Container
         self.grid_container = ctk.CTkFrame(chan_panel, fg_color=("#ebebeb", "#2b2b2b"))
@@ -190,7 +198,7 @@ class LDCControllerApp(ctk.CTk):
             lbl = ctk.CTkLabel(self.grid_container, text=header_text, font=("Segoe UI", 10, "bold"))
             # Custom styling color for live readouts
             if "Live" in header_text:
-                lbl.configure(text_color="#4af24a")
+                lbl.configure(text_color="#2e7d32")
             lbl.grid(row=0, column=col_idx, padx=3, pady=5)
 
         # Store UI elements per channel
@@ -218,7 +226,7 @@ class LDCControllerApp(ctk.CTk):
             ent_label.bind("<KeyRelease>", self.mark_profile_unsaved)
 
             # LED Indicator Canvas
-            led = LEDIndicator(self.grid_container, size=16, color="#444444")
+            led = LEDIndicator(self.grid_container, size=16, color="#b0bec5")
             led.grid(row=row, column=3, padx=3, pady=3)
 
             # Status Label
@@ -260,6 +268,7 @@ class LDCControllerApp(ctk.CTk):
             ent_target_t.insert(0, "22.0")
             ent_target_t.grid(row=row, column=11, padx=3, pady=3)
             ent_target_t.bind("<KeyRelease>", self.mark_profile_unsaved)
+            ent_target_t.bind("<FocusOut>", lambda e, w=ent_target_t: self._validate_numeric_entry(w))
 
             # Max Temp Limit Label
             lbl_max_t = ctk.CTkLabel(self.grid_container, text="-", text_color="#666666", font=("Segoe UI", 10))
@@ -270,6 +279,7 @@ class LDCControllerApp(ctk.CTk):
             ent_target_i.insert(0, "0.0")
             ent_target_i.grid(row=row, column=13, padx=3, pady=3)
             ent_target_i.bind("<KeyRelease>", self.mark_profile_unsaved)
+            ent_target_i.bind("<FocusOut>", lambda e, w=ent_target_i: self._validate_numeric_entry(w))
 
             # Max Current Limit Label
             lbl_max_i = ctk.CTkLabel(self.grid_container, text="-", text_color="#666666", font=("Segoe UI", 10))
@@ -308,29 +318,35 @@ class LDCControllerApp(ctk.CTk):
         self.grid_container.grid_rowconfigure(master_row_2, weight=1)
 
         # Master All ON/OFF aligned with live readouts
-        self.btn_master_on = ctk.CTkButton(self.grid_container, text="MASTER All ON", font=("Segoe UI", 10, "bold"), text_color="#4af24a",
+        self.btn_master_on = ctk.CTkButton(self.grid_container, text="MASTER All ON", font=("Segoe UI", 10, "bold"),
+                                            fg_color="#2e7d32", hover_color="#1b5e20", text_color="white",
                                             state="disabled", command=lambda: self.set_all_systems("ON"))
         self.btn_master_on.grid(row=master_row_1, column=7, columnspan=2, padx=3, pady=3, sticky="ew")
 
-        self.btn_master_off = ctk.CTkButton(self.grid_container, text="MASTER All OFF", font=("Segoe UI", 10, "bold"), text_color="#ff5555",
+        self.btn_master_off = ctk.CTkButton(self.grid_container, text="MASTER All OFF", font=("Segoe UI", 10, "bold"),
+                                             fg_color="#d32f2f", hover_color="#c62828", text_color="white",
                                              state="disabled", command=lambda: self.set_all_systems("OFF"))
         self.btn_master_off.grid(row=master_row_2, column=7, columnspan=2, padx=3, pady=3, sticky="ew")
 
         # TEC All ON/OFF aligned under Target TEC
-        self.btn_tec_on = ctk.CTkButton(self.grid_container, text="TEC All ON", font=("Segoe UI", 9, "bold"), text_color="#4af24a",
+        self.btn_tec_on = ctk.CTkButton(self.grid_container, text="TEC All ON", font=("Segoe UI", 9, "bold"),
+                                         fg_color="#2e7d32", hover_color="#1b5e20", text_color="white",
                                          state="disabled", command=lambda: self.set_all_dropdowns("TEC", "ON"))
         self.btn_tec_on.grid(row=master_row_1, column=9, padx=3, pady=3, sticky="ew")
 
-        self.btn_tec_off = ctk.CTkButton(self.grid_container, text="TEC All OFF", font=("Segoe UI", 9, "bold"), text_color="#ff5555",
+        self.btn_tec_off = ctk.CTkButton(self.grid_container, text="TEC All OFF", font=("Segoe UI", 9, "bold"),
+                                          fg_color="#d32f2f", hover_color="#c62828", text_color="white",
                                           state="disabled", command=lambda: self.set_all_dropdowns("TEC", "OFF"))
         self.btn_tec_off.grid(row=master_row_2, column=9, padx=3, pady=3, sticky="ew")
 
         # LAS All ON/OFF aligned under Target LAS
-        self.btn_las_on = ctk.CTkButton(self.grid_container, text="LAS All ON", font=("Segoe UI", 9, "bold"), text_color="#4af24a",
+        self.btn_las_on = ctk.CTkButton(self.grid_container, text="LAS All ON", font=("Segoe UI", 9, "bold"),
+                                         fg_color="#2e7d32", hover_color="#1b5e20", text_color="white",
                                          state="disabled", command=lambda: self.set_all_dropdowns("LAS", "ON"))
         self.btn_las_on.grid(row=master_row_1, column=10, padx=3, pady=3, sticky="ew")
 
-        self.btn_las_off = ctk.CTkButton(self.grid_container, text="LAS All OFF", font=("Segoe UI", 9, "bold"), text_color="#ff5555",
+        self.btn_las_off = ctk.CTkButton(self.grid_container, text="LAS All OFF", font=("Segoe UI", 9, "bold"),
+                                          fg_color="#d32f2f", hover_color="#c62828", text_color="white",
                                           state="disabled", command=lambda: self.set_all_dropdowns("LAS", "OFF"))
         self.btn_las_off.grid(row=master_row_2, column=10, padx=3, pady=3, sticky="ew")
 
@@ -353,18 +369,21 @@ class LDCControllerApp(ctk.CTk):
         self.t_ramp_edit.insert(0, "0.1")
         self.t_ramp_edit.grid(row=0, column=1, padx=5, pady=5, sticky="w")
         self.t_ramp_edit.bind("<KeyRelease>", self.mark_profile_unsaved)
+        self.t_ramp_edit.bind("<FocusOut>", lambda e: self._validate_numeric_entry(self.t_ramp_edit, min_val=0.0001))
 
         ctk.CTkLabel(bot_panel, text="I Ramp (mA/s):", font=("Segoe UI", 10, "bold")).grid(row=1, column=0, padx=(15, 5), pady=5, sticky="w")
         self.i_ramp_edit = ctk.CTkEntry(bot_panel, width=90)
         self.i_ramp_edit.insert(0, "0.5")
         self.i_ramp_edit.grid(row=1, column=1, padx=5, pady=5, sticky="w")
         self.i_ramp_edit.bind("<KeyRelease>", self.mark_profile_unsaved)
+        self.i_ramp_edit.bind("<FocusOut>", lambda e: self._validate_numeric_entry(self.i_ramp_edit, min_val=0.0001))
 
         ctk.CTkLabel(bot_panel, text="T OFF Target (°C):", font=("Segoe UI", 10, "bold")).grid(row=0, column=2, padx=(20, 5), pady=5, sticky="w")
         self.t_off_edit = ctk.CTkEntry(bot_panel, width=90)
         self.t_off_edit.insert(0, "22.0")
         self.t_off_edit.grid(row=0, column=3, padx=5, pady=5, sticky="w")
         self.t_off_edit.bind("<KeyRelease>", self.mark_profile_unsaved)
+        self.t_off_edit.bind("<FocusOut>", lambda e: self._validate_numeric_entry(self.t_off_edit))
 
         # Profile configurations actions
         self.btn_save = ctk.CTkButton(bot_panel, text="💾 Save Profile", width=120, command=self.save_config)
@@ -384,14 +403,36 @@ class LDCControllerApp(ctk.CTk):
                                            text_color="white", state="disabled", width=170, height=60, command=self.execute_all)
         self.btn_exec_all.grid(row=0, column=6, rowspan=2, padx=10, pady=10, sticky="nsew")
 
-        self.btn_stop = ctk.CTkButton(bot_panel, text="⏹ CANCEL RUN (Safe)", font=("Segoe UI", 11, "bold"), fg_color="#d62728", hover_color="#b01d1d",
+        self.btn_stop = ctk.CTkButton(bot_panel, text="⏹ CANCEL RUN (Safe)", font=("Segoe UI", 11, "bold"), fg_color="#d32f2f", hover_color="#c62828",
                                        text_color="white", state="disabled", width=170, command=self.stop_execution)
         self.btn_stop.grid(row=2, column=6, padx=10, pady=10, sticky="nsew")
 
         # Emergency Laser Off
-        self.btn_emerg = ctk.CTkButton(bot_panel, text="⚠\nE\nM\nO\n\nO\nF\nF", font=("Segoe UI", 9, "bold"), fg_color="#ff0000", hover_color="#cc0000",
+        self.btn_emerg = ctk.CTkButton(bot_panel, text="⚠\nEMO\nOFF", font=("Segoe UI", 9, "bold"), fg_color="#d32f2f", hover_color="#b71c1c",
                                         text_color="white", state="disabled", width=60, command=self.emergency_las_off)
         self.btn_emerg.grid(row=0, column=5, rowspan=3, padx=10, pady=10, sticky="nsew")
+
+    # ----------------------------------------------------
+    # INPUT VALIDATION HELPERS
+    # ----------------------------------------------------
+    def _validate_numeric_entry(self, widget, min_val=None, max_val=None):
+        """Visual validation for numeric CTkEntry fields. Highlights red on invalid input."""
+        raw = widget.get().strip()
+        valid = True
+        try:
+            val = float(raw)
+            if min_val is not None and val <= min_val - 1e-9:
+                valid = False
+            if max_val is not None and val > max_val:
+                valid = False
+        except ValueError:
+            valid = False
+
+        if valid:
+            widget.configure(border_color=("#979da2", "#565b5e"))  # default
+        else:
+            widget.configure(border_color="#ff5555")  # red highlight
+        return valid
 
     # ----------------------------------------------------
     # PROFILE SETTING HELPERS
@@ -399,7 +440,17 @@ class LDCControllerApp(ctk.CTk):
     def mark_profile_unsaved(self, *args):
         text = self.lbl_profile.cget("text")
         if not text.startswith("* "):
-            self.lbl_profile.configure(text=f"* {text}", text_color="#ff9f43")
+            self.lbl_profile.configure(text=f"* {text}", text_color="#ef6c00")
+
+    def refresh_ports(self):
+        self.avail_ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.avail_ports.append("Demo Simulator")
+        self.com_dropdown.configure(values=self.avail_ports)
+        real_ports = [p for p in self.avail_ports if p != "Demo Simulator"]
+        if real_ports:
+            self.com_dropdown.set(real_ports[0])
+        else:
+            self.com_dropdown.set("Demo Simulator")
 
     def load_last_profile_preference(self):
         pref_file = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
@@ -428,6 +479,7 @@ class LDCControllerApp(ctk.CTk):
         
         try:
             config_data = {
+                "COM_Port": self.com_dropdown.get(),
                 "T_ramp": float(self.t_ramp_edit.get()),
                 "I_ramp": float(self.i_ramp_edit.get()),
                 "T_OFF_Target": float(self.t_off_edit.get()),
@@ -469,6 +521,20 @@ class LDCControllerApp(ctk.CTk):
                 if not messagebox.askyesno("Channel Count Mismatch", msg):
                     return
 
+            if "COM_Port" in config_data:
+                com_port = config_data["COM_Port"]
+                if com_port not in self.avail_ports:
+                    # Update available ports to include the one from the profile if missing
+                    self.avail_ports.append(com_port)
+                    self.com_dropdown.configure(values=self.avail_ports)
+                self.com_dropdown.set(com_port)
+                
+                # If connected to a different port, or disconnected, try to connect
+                if not self.ser or self.ser.port != com_port:
+                    if self.ser:
+                        self.disconnect_serial()
+                    self.connect_serial()
+
             self.t_ramp_edit.delete(0, tk.END)
             self.t_ramp_edit.insert(0, str(config_data["T_ramp"]))
             self.i_ramp_edit.delete(0, tk.END)
@@ -493,6 +559,9 @@ class LDCControllerApp(ctk.CTk):
 
             # If connected, lock/unlock fields accordingly to protect
             self.lock_ui("normal" if self.btn_scan.cget("state") == "disabled" and self.avail_ports else "disabled")
+
+            # P3 #12: Show success popup to match MATLAB behaviour
+            messagebox.showinfo("Profile Loaded", f'Hardware configuration profile "{name}" has been loaded.')
         except Exception as e:
             messagebox.showerror("Load Error", f"Failed to load config file. It might be corrupted or outdated:\n{e}")
 
@@ -528,9 +597,9 @@ class LDCControllerApp(ctk.CTk):
         # Don't permit disconnect during sequence execution
         if self.is_executing:
             if self.is_stop_requested:
-                self.status_label.configure(text="Status: WAITING for halt...", text_color="#ff9f43")
+                self.status_label.configure(text="Status: WAITING for halt...", text_color="#ef6c00")
             else:
-                self.status_label.configure(text="Status: PRESS STOP BEFORE DISCONNECTING!", text_color="#ff5555")
+                self.status_label.configure(text="Status: PRESS STOP BEFORE DISCONNECTING!", text_color="#c62828")
             return
 
         # Handle Disconnect
@@ -548,7 +617,7 @@ class LDCControllerApp(ctk.CTk):
                     self.ser = None
 
             self.is_simulated = False
-            self.status_label.configure(text="Status: Disconnected", text_color="#ff5555")
+            self.status_label.configure(text="Status: Disconnected", text_color="#c62828")
             self.btn_connect.configure(text="Connect", fg_color=None)
             self.com_dropdown.configure(state="normal")
             self.btn_scan.configure(state="disabled")
@@ -566,8 +635,8 @@ class LDCControllerApp(ctk.CTk):
         self.is_simulated = (port_choice == "Demo Simulator")
 
         if self.is_simulated:
-            self.status_label.configure(text="Status: Demo Mode Active", text_color="#d284d2")
-            self.btn_connect.configure(text="Disconnect", fg_color="#d62728")
+            self.status_label.configure(text="Status: Demo Mode Active", text_color="#7b1fa2")
+            self.btn_connect.configure(text="Disconnect", fg_color="#d32f2f")
             self.com_dropdown.configure(state="disabled")
             self.btn_scan.configure(state="normal")
             self.btn_clear_faults.configure(state="normal")
@@ -576,13 +645,13 @@ class LDCControllerApp(ctk.CTk):
         try:
             self.ser = serial.Serial(port_choice, baudrate=9600, timeout=5.0)
             self.ser.reset_input_buffer()
-            self.status_label.configure(text="Status: Connected (Ready)", text_color="#4af24a")
-            self.btn_connect.configure(text="Disconnect", fg_color="#d62728")
+            self.status_label.configure(text="Status: Connected (Ready)", text_color="#2e7d32")
+            self.btn_connect.configure(text="Disconnect", fg_color="#d32f2f")
             self.com_dropdown.configure(state="disabled")
             self.btn_scan.configure(state="normal")
             self.btn_clear_faults.configure(state="normal")
         except Exception as e:
-            self.status_label.configure(text="Status: Connection Failed", text_color="#ff5555")
+            self.status_label.configure(text="Status: Connection Failed", text_color="#c62828")
             messagebox.showerror("Connection Error", f"Failed to connect to {port_choice}:\n{e}")
 
     # --- Write and Read Command Wrappers ---
@@ -591,14 +660,20 @@ class LDCControllerApp(ctk.CTk):
             self.process_sim_cmd(cmd)
         else:
             if self.ser:
-                self.ser.write(f"{cmd}\n".encode("ascii"))
+                try:
+                    self.ser.write(f"{cmd}\n".encode("ascii"))
+                except serial.SerialException as e:
+                    raise serial.SerialException(f"Hardware connection lost during write: {e}")
 
     def read_cmd(self):
         if self.is_simulated:
             return self.process_sim_query()
         else:
             if self.ser:
-                raw = self.ser.readline()
+                try:
+                    raw = self.ser.readline()
+                except serial.SerialException as e:
+                    raise serial.SerialException(f"Hardware connection lost during read: {e}")
                 try:
                     return raw.decode("ascii").strip()
                 except:
@@ -719,7 +794,7 @@ class LDCControllerApp(ctk.CTk):
         self.btn_scan.configure(state="disabled")
         self.btn_exec_all.configure(state="disabled")
         self.lock_ui("disabled")
-        self.status_label.configure(text="Status: Scanning active hardware...", text_color="#ff9f43")
+        self.status_label.configure(text="Status: Scanning active hardware...", text_color="#ef6c00")
         
         # Run scan loop in a background thread to prevent UI freezing
         threading.Thread(target=self.run_channel_scan, daemon=True).start()
@@ -738,12 +813,13 @@ class LDCControllerApp(ctk.CTk):
                     if not self.is_simulated and self.ser:
                         self.ser.reset_input_buffer()
                     
-                    # Command switch channel
-                    self.send_cmd(f"CHAN {ch_num}")
+                    # P0 #2: Use cmd_pause (send + 0.15s wait) to match MATLAB cmdPause,
+                    # then an extra 0.1s settling before querying — total 0.25s as in MATLAB.
+                    self.cmd_pause(f"CHAN {ch_num}")
                     time.sleep(0.1)
                     if self.is_closing:
                         break
-                    
+
                     ans_chan_str = self.query_cmd("CHAN?")
                     if not self.is_simulated and self.ser:
                         self.ser.timeout = 1.0
@@ -870,19 +946,19 @@ class LDCControllerApp(ctk.CTk):
 
         # Update LED colors and status text
         if has_hw_err:
-            ch["status"].configure(text=f"FAULT: {hw_err_str}", text_color="#ff5555")
+            ch["status"].configure(text=f"FAULT: {hw_err_str}", text_color="#c62828")
             ch["led"].set_color("#ff0000")
         elif tec_out == 1 and las_out == 1:
-            ch["status"].configure(text="TEC ON, LAS ON", text_color="#ff9f43")
+            ch["status"].configure(text="TEC ON, LAS ON", text_color="#ef6c00")
             ch["led"].set_color("#2ca02c")
         elif tec_out == 1:
-            ch["status"].configure(text="TEC ON, LAS OFF", text_color="#ff9f43")
+            ch["status"].configure(text="TEC ON, LAS OFF", text_color="#ef6c00")
             ch["led"].set_color("#ffdd00")
         elif las_out == 1:
-            ch["status"].configure(text="WARNING: LAS ON, TEC OFF", text_color="#ff5555")
+            ch["status"].configure(text="WARNING: LAS ON, TEC OFF", text_color="#c62828")
             ch["led"].set_color("#ff0000")
         else:
-            ch["status"].configure(text="Ready", text_color="#4af24a")
+            ch["status"].configure(text="Ready", text_color="#2e7d32")
             ch["led"].set_color("#2ca02c")
 
     def finish_channel_scan(self, cards_found):
@@ -892,9 +968,9 @@ class LDCControllerApp(ctk.CTk):
             return
 
         if cards_found == 0:
-            self.status_label.configure(text="WARNING: 0 slots responded. Check connection & power.", text_color="#ff9f43")
+            self.status_label.configure(text="WARNING: 0 slots responded. Check connection & power.", text_color="#ef6c00")
         else:
-            self.status_label.configure(text="Status: Scan Complete & Matched", text_color="#4af24a")
+            self.status_label.configure(text="Status: Scan Complete & Matched", text_color="#2e7d32")
 
         self.lock_ui("normal")
 
@@ -990,8 +1066,11 @@ class LDCControllerApp(ctk.CTk):
                 if ch["enable_chk"].cget("state") == "normal":
                     ch_num = k + 1
                     try:
-                        self.send_cmd(f"CHAN {ch_num}")
-                        
+                        # P0 #4: cmd_pause includes the 0.15s settling delay after CHAN
+                        # switch that MATLAB's cmdPause() provided. Without it the next
+                        # query may return data from the previously selected channel.
+                        self.cmd_pause(f"CHAN {ch_num}")
+
                         t_val_str = self.query_cmd("TEC:T?")
                         try:
                             t_val = float(t_val_str)
@@ -1022,8 +1101,15 @@ class LDCControllerApp(ctk.CTk):
                         if las_stat == 1:
                             any_laser_on = True
 
+                        self.telemetry_fail_count = 0  # Reset on success
+
                     except Exception as e:
                         print(f"Background telemetry failed on channel {ch_num}: {e}")
+                        self.telemetry_fail_count += 1
+                        if self.telemetry_fail_count > 3:
+                            self.telemetry_active = False
+                            self.after(0, self.handle_telemetry_connection_loss)
+                            break
 
             # Update EMO button status
             if any_laser_on:
@@ -1035,27 +1121,40 @@ class LDCControllerApp(ctk.CTk):
                 self.ser.timeout = old_timeout
 
     def update_telemetry_widgets(self, idx, t_val, i_val, tec_stat, las_stat):
-        ch = self.ch_ui[idx]
-        if t_val is not None:
-            set_entry_val(ch["cur_t"], f"{t_val:.1f}")
-        if i_val is not None:
-            set_entry_val(ch["cur_i"], f"{i_val:.1f}")
+        try:
+            if self.is_closing:
+                return
+            ch = self.ch_ui[idx]
+            if t_val is not None:
+                set_entry_val(ch["live_t"], f"{t_val:.1f}")
+            if i_val is not None:
+                set_entry_val(ch["live_i"], f"{i_val:.1f}")
 
-        if tec_stat is not None:
-            if tec_stat == 1:
-                ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
-                set_entry_val(ch["live_tec"], "ON")
-            else:
-                ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
-                set_entry_val(ch["live_tec"], "OFF")
+            if tec_stat is not None:
+                if tec_stat == 1:
+                    ch["live_tec"].configure(fg_color="#2ca02c", text_color="white")
+                    set_entry_val(ch["live_tec"], "ON")
+                else:
+                    ch["live_tec"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+                    set_entry_val(ch["live_tec"], "OFF")
 
-        if las_stat is not None:
-            if las_stat == 1:
-                ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
-                set_entry_val(ch["live_las"], "ON")
-            else:
-                ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
-                set_entry_val(ch["live_las"], "OFF")
+            if las_stat is not None:
+                if las_stat == 1:
+                    ch["live_las"].configure(fg_color="#2ca02c", text_color="white")
+                    set_entry_val(ch["live_las"], "ON")
+                else:
+                    ch["live_las"].configure(fg_color=("#d5d5d5", "#3a3a3a"), text_color=("black", "#888888"))
+                    set_entry_val(ch["live_las"], "OFF")
+        except tk.TclError:
+            pass
+
+    def handle_telemetry_connection_loss(self):
+        self.status_label.configure(text="Status: Connection Lost", text_color="#c62828")
+        self.lock_ui("disabled")
+        self.btn_connect.configure(text="Connect", fg_color="#1976D2")
+        self.ser = None
+        messagebox.showerror("Connection Lost", "Hardware communication lost. Execution halted. Lasers not explicitly shut off.")
+        self.is_stop_requested = True
 
     # ----------------------------------------------------
     # MASTER DROPDOWN / OVERRIDE FUNCTIONS
@@ -1082,8 +1181,11 @@ class LDCControllerApp(ctk.CTk):
     def stop_execution(self):
         if self.is_executing:
             self.is_stop_requested = True
-            self.status_label.configure(text="Status: STOP COMMANDED. Halting safely...", text_color="#ff5555")
+            self.status_label.configure(text="Status: STOP COMMANDED. Halting safely...", text_color="#c62828")
+            # P3 #9: Triple bell matches MATLAB triple-beep auditory alert in lab environments
             self.bell()
+            self.after(150, self.bell)
+            self.after(300, self.bell)
 
     def emergency_las_off(self):
         self.btn_emerg.configure(state="disabled")
@@ -1092,12 +1194,15 @@ class LDCControllerApp(ctk.CTk):
             self.btn_emerg.configure(state="normal")
             return
 
-        # Start emergency off routine in background
-        threading.Thread(target=self.run_emergency_las_off_thread, daemon=True).start()
+        # P1 #6: EMO thread must NOT be a daemon — laser-off commands must complete
+        # even if the main thread is exiting. Track it for join-on-close.
+        self._emo_thread = threading.Thread(target=self.run_emergency_las_off_thread, daemon=False)
+        self._emo_thread.start()
 
     def run_emergency_las_off_thread(self):
         with self.serial_lock:
             for k in range(self.num_channels):
+                # P2 #7: Abort gracefully if app is closing (Removed: EMO must complete)
                 ch = self.ch_ui[k]
                 if ch["enable_chk"].cget("state") == "normal":
                     ch_num = k + 1
@@ -1105,19 +1210,19 @@ class LDCControllerApp(ctk.CTk):
                         self.send_cmd(f"CHAN {ch_num}")
                         time.sleep(0.15)
                         self.send_cmd("LAS:OUTPUT 0")
-                        
+
                         # Update UI
                         self.after(0, self.update_channel_emergency_off, k)
                     except:
                         pass
-            
+
             self.after(0, self.finish_emergency_las_off)
 
     def update_channel_emergency_off(self, idx):
         ch = self.ch_ui[idx]
         ch["live_las"].configure(fg_color="#3a3a3a", text_color="#888888")
         set_entry_val(ch["live_las"], "OFF")
-        ch["status"].configure(text="EMERGENCY OFF: Current Cut", text_color="#ff5555")
+        ch["status"].configure(text="EMERGENCY OFF: Current Cut", text_color="#c62828")
         ch["led"].set_color("#ff0000")
 
     def finish_emergency_las_off(self):
@@ -1127,7 +1232,7 @@ class LDCControllerApp(ctk.CTk):
 
     def clear_faults(self):
         self.lock_ui("disabled")
-        self.status_label.configure(text="Status: Clearing chassis faults...", text_color="#ff9f43")
+        self.status_label.configure(text="Status: Clearing chassis faults...", text_color="#ef6c00")
         threading.Thread(target=self.run_clear_faults, daemon=True).start()
 
     def run_clear_faults(self):
@@ -1146,6 +1251,9 @@ class LDCControllerApp(ctk.CTk):
                     except:
                         pass
 
+        # P1 #8: Set is_scanning flag so the telemetry loop won't collide
+        # with the subsequent re-scan on the serial port.
+        self.is_scanning = True
         # Trigger a scan again to refresh hardware status
         self.run_channel_scan()
 
@@ -1187,7 +1295,7 @@ class LDCControllerApp(ctk.CTk):
         # Prepare state variables
         self.is_executing = True
         self.is_stop_requested = False
-        self.status_label.configure(text="Status: Sequence Running...", text_color="#4af24a")
+        self.status_label.configure(text="Status: Sequence Running...", text_color="#2e7d32")
 
         self.lock_ui("disabled")
         self.btn_stop.configure(state="normal")
@@ -1262,7 +1370,7 @@ class LDCControllerApp(ctk.CTk):
                 t_on_target = float(ch["t_target"].get())
                 i_on_target = float(ch["i_target"].get())
             except ValueError:
-                self.after(0, self.update_channel_status, ch_num - 1, "Invalid targets", "#ff5555")
+                self.after(0, self.update_channel_status, ch_num - 1, "Invalid targets", "#c62828")
                 continue
 
             try:
@@ -1308,17 +1416,21 @@ class LDCControllerApp(ctk.CTk):
                 if "HALT" in err_msg:
                     status_text = ch["status"].cget("text")
                     if status_text == "Initializing...":
-                        self.after(0, self.update_channel_status, ch_num - 1, "HALTED (Before Ramp)", "#ff5555")
+                        self.after(0, self.update_channel_status, ch_num - 1, "HALTED (Before Ramp)", "#c62828")
                     else:
-                        self.after(0, self.update_channel_status, ch_num - 1, 
-                                   f"HALTED at {ch['cur_t'].get()}°C, {ch['cur_i'].get()}mA", "#ff5555")
+                        self.after(0, self.update_channel_status, ch_num - 1,
+                                   f"HALTED at {ch['cur_t'].get()}°C, {ch['cur_i'].get()}mA", "#c62828")
                 else:
-                    self.after(0, self.update_channel_status, ch_num - 1, err_msg[:30], "#ff5555")
+                    # P2 #10: Show full error message — truncation hid critical fault info
+                    self.after(0, self.update_channel_status, ch_num - 1, err_msg, "#c62828")
                     self.after(0, ch["led"].set_color, "#ff0000")
                     print(f"[Hardware Fault] Channel {ch_num}: {err_msg}")
 
                 self.is_stop_requested = True
+                # P3 #9: Triple bell matches MATLAB triple-beep for hardware fault alert
                 self.bell()
+                self.after(150, self.bell)
+                self.after(300, self.bell)
                 break
 
         # Finished Phase Cleanup
@@ -1327,9 +1439,9 @@ class LDCControllerApp(ctk.CTk):
         self.after(0, lambda: self.btn_stop.configure(state="disabled"))
 
         if self.is_stop_requested:
-            self.after(0, lambda: self.status_label.configure(text="Status: Hardware Halted & Pinned.", text_color="#ff5555"))
+            self.after(0, lambda: self.status_label.configure(text="Status: Hardware Halted & Pinned.", text_color="#c62828"))
         else:
-            self.after(0, lambda: self.status_label.configure(text="Status: Sequence Complete & Settled.", text_color="#4af24a"))
+            self.after(0, lambda: self.status_label.configure(text="Status: Sequence Complete & Settled.", text_color="#2e7d32"))
             if len(channels_to_run) > 1:
                 self.bell()
                 self.after(0, lambda: messagebox.showinfo("Done", "Sequence completed across all selected channels."))
@@ -1474,8 +1586,18 @@ class LDCControllerApp(ctk.CTk):
                 self.safe_pause(0.15)
                 self.ramp_current(i_on_target, i_ramp, idx)
         else:
-            self.after(0, self.update_channel_status, idx, "Warning Status Collision. Skipping.", "#ff5555")
-            return
+            if tec_curr_status == 0 and las_curr_status == 1:
+                self.after(0, self.update_channel_status, idx, "CRITICAL: Laser ON without TEC. Ramping down safely.", "#c62828")
+                self.ramp_current(0.0, i_ramp, idx)
+                self.safe_pause(0.15)
+                self.send_cmd("LAS:OUTPUT 0")
+                self.safe_pause(0.2)
+                self.verify_hw_state("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+                self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
+                raise RuntimeError(f"CRITICAL FAULT CH {ch_num}: Laser ON while TEC OFF. Ramped down laser safely.")
+            else:
+                self.after(0, self.update_channel_status, idx, "Warning Status Collision. Skipping.", "#c62828")
+                return
 
         if not self.is_stop_requested:
             self.final_check(ch_num)
@@ -1504,13 +1626,14 @@ class LDCControllerApp(ctk.CTk):
             raise RuntimeError("Telemetry lost during initial Thermal readout.")
 
         if abs(t_curr - t_target) < 0.05:
-            self.after(0, self.update_channel_status, idx, f"T at Target ({t_curr:.1f} °C)", "#4af24a")
+            self.after(0, self.update_channel_status, idx, f"T at Target ({t_curr:.1f} °C)", "#2e7d32")
             return
 
         t_set = t_curr
         t_start = t_curr
         step = ((1 if t_target > t_curr else -1) * abs(t_ramp) * 0.5)
 
+        t_fail_count = 0
         while abs(t_set - t_target) > 0.01:
             if self.is_stop_requested:
                 raise RuntimeError("HALT")
@@ -1530,7 +1653,13 @@ class LDCControllerApp(ctk.CTk):
             t_curr_str = self.query_cmd("TEC:SYNCT?")
             try:
                 t_curr = float(t_curr_str)
+                if math.isnan(t_curr):
+                    raise ValueError("NaN")
+                t_fail_count = 0
             except:
+                t_fail_count += 1
+                if t_fail_count > 3:
+                    raise RuntimeError("Hardware communication lost during ramp. Stopping execution.")
                 t_curr = t_set
 
             # Update entry box readout
@@ -1541,7 +1670,7 @@ class LDCControllerApp(ctk.CTk):
             num_blocks = round(pct * 10)
             prog_bar = '█' * num_blocks + '░' * (10 - num_blocks)
             
-            self.after(0, self.update_channel_status, idx, f"[{prog_bar}] ({t_curr:.1f} °C)", "#3377ff")
+            self.after(0, self.update_channel_status, idx, f"[{prog_bar}] ({t_curr:.1f} °C)", "#1565c0")
 
     def ramp_current(self, i_target, i_ramp, idx):
         ch = self.ch_ui[idx]
@@ -1558,13 +1687,14 @@ class LDCControllerApp(ctk.CTk):
             raise RuntimeError("Telemetry lost during initial Laser readout.")
 
         if abs(i_curr - i_target) < 0.05:
-            self.after(0, self.update_channel_status, idx, f"I at Target ({i_curr:.1f} mA)", "#4af24a")
+            self.after(0, self.update_channel_status, idx, f"I at Target ({i_curr:.1f} mA)", "#2e7d32")
             return
 
         i_set = i_curr
         i_start = i_curr
         step = ((1 if i_target > i_curr else -1) * abs(i_ramp) * 0.5)
 
+        i_fail_count = 0
         while abs(i_set - i_target) > 0.01:
             if self.is_stop_requested:
                 raise RuntimeError("HALT")
@@ -1583,7 +1713,13 @@ class LDCControllerApp(ctk.CTk):
             i_curr_str = self.query_cmd("LAS:SYNCLDI?")
             try:
                 i_curr = float(i_curr_str)
+                if math.isnan(i_curr):
+                    raise ValueError("NaN")
+                i_fail_count = 0
             except:
+                i_fail_count += 1
+                if i_fail_count > 3:
+                    raise RuntimeError("Hardware communication lost during ramp. Stopping execution.")
                 i_curr = i_set
 
             self.after(0, set_entry_val, ch["cur_i"], f"{i_curr:.1f}")
@@ -1593,7 +1729,7 @@ class LDCControllerApp(ctk.CTk):
             num_blocks = round(pct * 10)
             prog_bar = '█' * num_blocks + '░' * (10 - num_blocks)
             
-            self.after(0, self.update_channel_status, idx, f"[{prog_bar}] ({i_curr:.1f} mA)", "#d284d2")
+            self.after(0, self.update_channel_status, idx, f"[{prog_bar}] ({i_curr:.1f} mA)", "#7b1fa2")
 
     def final_check(self, ch_num):
         idx = ch_num - 1
@@ -1624,7 +1760,7 @@ class LDCControllerApp(ctk.CTk):
             status_str += "LAS OFF"
             self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
 
-        self.after(0, self.update_channel_status, idx, status_str, "#4af24a")
+        self.after(0, self.update_channel_status, idx, status_str, "#2e7d32")
         self.after(0, ch["led"].set_color, "#2ca02c")
 
         self.send_cmd("LAS:MOD 1")
@@ -1722,10 +1858,10 @@ class LDCControllerApp(ctk.CTk):
 
         if rem > 0.0:
             self.after(0, lambda: self.status_label.configure(
-                text=f"Status: Sequence Running... (Time Remaining: {mins:02d}:{secs:02d})", text_color="#4af24a"))
+                text=f"Status: Sequence Running... (Time Remaining: {mins:02d}:{secs:02d})", text_color="#2e7d32"))
         else:
             self.after(0, lambda: self.status_label.configure(
-                text="Status: Sequence Running... (Finishing up)", text_color="#4af24a"))
+                text="Status: Sequence Running... (Finishing up)", text_color="#2e7d32"))
 
     # ----------------------------------------------------
     # APPLICATION CLEANUP & SHUTDOWN
@@ -1761,10 +1897,15 @@ class LDCControllerApp(ctk.CTk):
     def do_cleanup_and_close(self):
         self.is_closing = True
         self.telemetry_active = False
-        
+
         # Join telemetry thread
         if self.telemetry_thread and self.telemetry_thread.is_alive():
             self.telemetry_thread.join(timeout=1.0)
+
+        # P1 #6: Join EMO thread — it's non-daemon so laser-off commands must complete
+        emo_thread = getattr(self, "_emo_thread", None)
+        if emo_thread and emo_thread.is_alive():
+            emo_thread.join(timeout=3.0)
 
         # Close serial port
         with self.serial_lock:
