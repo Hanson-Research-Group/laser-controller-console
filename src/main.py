@@ -19,6 +19,7 @@ from tkinter import filedialog, messagebox
 
 from laser_controller import LaserController
 from sequencer import Sequencer, SequenceEvents, ChannelPlan
+import theme
 
 import ctypes
 try:
@@ -40,32 +41,49 @@ def resolve_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 class LEDIndicator(tk.Canvas):
-    """A custom Tkinter widget to draw a beautiful, smooth status LED."""
+    """A custom Tkinter widget to draw a beautiful, smooth status LED.
+
+    The LED lives on a bare tk.Canvas, which CustomTkinter does not theme, so its
+    background is resolved from the parent frame (or the theme's frame color when
+    the parent is transparent) for the active appearance mode — and can be
+    refreshed on a light/dark toggle via refresh_theme()."""
     def __init__(self, parent, size=18, color="#cccccc", **kwargs):
-        # Dynamically resolve background color based on parent CustomTkinter frame color
-        bg_color = "#ebebeb"
-        try:
-            parent_fg = parent.cget("fg_color")
-            if isinstance(parent_fg, (list, tuple)):
-                mode = ctk.get_appearance_mode().lower()
-                bg_color = parent_fg[0] if mode == "light" else parent_fg[1]
-            elif parent_fg and parent_fg != "transparent":
-                bg_color = parent_fg
-        except:
-            pass
-        super().__init__(parent, width=size, height=size, bg=bg_color, highlightthickness=0, **kwargs)
+        super().__init__(parent, width=size, height=size,
+                         bg=self._resolve_bg(parent), highlightthickness=0, **kwargs)
         self.size = size
         self.color = color
         self.draw_circle()
 
+    @staticmethod
+    def _resolve_bg(parent):
+        mode_idx = 0 if ctk.get_appearance_mode().lower() == "light" else 1
+        try:
+            parent_fg = parent.cget("fg_color")
+            if isinstance(parent_fg, (list, tuple)):
+                return parent_fg[mode_idx]
+            if parent_fg and parent_fg != "transparent":
+                return parent_fg
+        except Exception:
+            pass
+        # Transparent/unknown parent: fall back to the theme's frame color.
+        return theme.frame_bg()
+
     def draw_circle(self):
         self.delete("all")
-        self.create_oval(2, 2, self.size - 2, self.size - 2, 
+        self.create_oval(2, 2, self.size - 2, self.size - 2,
                          fill=self.color, outline=self.color, width=1.0)
 
     def set_color(self, color):
         self.color = color
         self.draw_circle()
+
+    def refresh_theme(self):
+        """Re-resolve the canvas background for the current appearance mode."""
+        try:
+            self.configure(bg=self._resolve_bg(self.master))
+            self.draw_circle()
+        except Exception:
+            pass
 
 
 class _TkSequenceEvents(SequenceEvents):
@@ -76,11 +94,12 @@ class _TkSequenceEvents(SequenceEvents):
     def __init__(self, app):
         self.app = app
 
-    def on_status(self, idx, text, color):
-        self.app.after(0, self.app.update_channel_status, idx, text, color)
+    def on_status(self, idx, text, kind):
+        # Map the engine's semantic status kind to a themed (light, dark) color.
+        self.app.after(0, self.app.update_channel_status, idx, text, theme.status(kind))
 
-    def on_led(self, idx, color):
-        self.app.after(0, self.app.ch_ui[idx]["led"].set_color, color)
+    def on_led(self, idx, kind):
+        self.app.after(0, self.app.ch_ui[idx]["led"].set_color, theme.led(kind))
 
     def on_live_output(self, idx, kind, state):
         self.app.after(0, self.app.update_live_out_ui, idx, kind, state)
@@ -262,11 +281,17 @@ class LDCControllerApp(ctk.CTk):
         self.btn_scan = ctk.CTkButton(top_frame, text="Scan Channels", width=162, state="disabled", command=self.start_channel_scan)
         self.btn_scan.grid(row=0, column=4, padx=5, pady=10)
 
-        self.btn_clear_faults = ctk.CTkButton(top_frame, text="Clear Faults", width=135, fg_color="transparent", text_color="#c62828", 
+        self.btn_clear_faults = ctk.CTkButton(top_frame, text="Clear Faults", width=135, fg_color="transparent", text_color=theme.status("fault"),
                                                hover_color="#ffebee", state="disabled", command=self.clear_faults)
         self.btn_clear_faults.grid(row=0, column=5, padx=5, pady=10)
 
-        self.status_label = ctk.CTkLabel(top_frame, text="Status: Disconnected", text_color="#c62828", font=("Segoe UI", 16, "bold"))
+        # Appearance (light/dark) toggle — user-selectable at runtime.
+        self.appearance_toggle = ctk.CTkSegmentedButton(
+            top_frame, values=["Light", "Dark"], width=140, command=self.set_appearance)
+        self.appearance_toggle.set(ctk.get_appearance_mode())
+        self.appearance_toggle.grid(row=0, column=6, padx=(10, 5), pady=10, sticky="e")
+
+        self.status_label = ctk.CTkLabel(top_frame, text="Status: Disconnected", text_color=theme.status("fault"), font=("Segoe UI", 16, "bold"))
         self.status_label.grid(row=0, column=7, padx=(10, 20), pady=10, sticky="e")
 
         # ----------------------------------------------------
@@ -327,7 +352,7 @@ class LDCControllerApp(ctk.CTk):
             ent_label.bind("<KeyRelease>", self.mark_profile_unsaved)
 
             # LED Indicator Canvas
-            led = LEDIndicator(self.grid_container, size=20, color="#b0bec5")
+            led = LEDIndicator(self.grid_container, size=20, color=theme.led("idle"))
             led.grid(row=row, column=3, padx=3, pady=3)
 
             # Status Label
@@ -554,6 +579,14 @@ class LDCControllerApp(ctk.CTk):
             self.com_dropdown.set(real_ports[0])
         else:
             self.com_dropdown.set("Demo Simulator")
+
+    def set_appearance(self, mode):
+        """Switch the light/dark theme at runtime. CustomTkinter widgets defined
+        with (light, dark) colors auto-switch; the custom LED canvases, which CTk
+        does not theme, are refreshed manually."""
+        ctk.set_appearance_mode(mode)
+        for ch in self.ch_ui:
+            ch["led"].refresh_theme()
 
     def load_last_profile_preference(self):
         pref_file = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
@@ -927,19 +960,19 @@ class LDCControllerApp(ctk.CTk):
         # Update LED colors and status text
         if has_hw_err:
             ch["status"].configure(text=f"FAULT: {hw_err_str}", text_color="#c62828")
-            ch["led"].set_color("#c62828")
+            ch["led"].set_color(theme.led("fault"))
         elif tec_out == 1 and las_out == 1:
             ch["status"].configure(text="TEC ON, LAS ON", text_color="#f57c00")
-            ch["led"].set_color("#2e7d32")
+            ch["led"].set_color(theme.led("ok"))
         elif tec_out == 1:
             ch["status"].configure(text="TEC ON, LAS OFF", text_color="#f57c00")
-            ch["led"].set_color("#f57c00")
+            ch["led"].set_color(theme.led("warn"))
         elif las_out == 1:
             ch["status"].configure(text="WARNING: LAS ON, TEC OFF", text_color="#c62828")
-            ch["led"].set_color("#c62828")
+            ch["led"].set_color(theme.led("fault"))
         else:
             ch["status"].configure(text="Ready", text_color="#2e7d32")
-            ch["led"].set_color("#2e7d32")
+            ch["led"].set_color(theme.led("ok"))
 
     def finish_channel_scan(self, cards_found):
         self.is_scanning = False
@@ -973,7 +1006,7 @@ class LDCControllerApp(ctk.CTk):
         set_entry_val(ch["live_las"], "OFF")
 
         ch["status"].configure(text=reason, text_color="#78909c")
-        ch["led"].set_color("#444444")
+        ch["led"].set_color(theme.led("empty"))
         set_entry_val(ch["cur_t"], "0.0")
         set_entry_val(ch["cur_i"], "0.0")
 
@@ -1222,7 +1255,7 @@ class LDCControllerApp(ctk.CTk):
         ch["live_las"].configure(fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
         set_entry_val(ch["live_las"], "OFF")
         ch["status"].configure(text="EMERGENCY OFF: Current Cut", text_color="#c62828")
-        ch["led"].set_color("#c62828")
+        ch["led"].set_color(theme.led("fault"))
 
     def finish_emergency_las_off(self):
         self.status_label.configure(text="Status: EMERGENCY LASER SHUTDOWN TRIGGERED.", text_color="#ff0000")
@@ -1417,16 +1450,16 @@ class LDCControllerApp(ctk.CTk):
         """UI response to a cooperative STOP / EMO halt on channel idx."""
         ch = self.ch_ui[idx]
         if ch["status"].cget("text") == "Initializing...":
-            self.update_channel_status(idx, "HALTED (Before Ramp)", "#c62828")
+            self.update_channel_status(idx, "HALTED (Before Ramp)", theme.status("fault"))
         else:
             self.update_channel_status(
-                idx, f"HALTED at {ch['cur_t'].get()}°C, {ch['cur_i'].get()}mA", "#c62828")
+                idx, f"HALTED at {ch['cur_t'].get()}°C, {ch['cur_i'].get()}mA", theme.status("fault"))
         self._triple_bell()
 
     def _handle_channel_fault(self, idx, message):
         """UI response to a hardware / validation fault on channel idx."""
-        self.update_channel_status(idx, message, "#c62828")
-        self.ch_ui[idx]["led"].set_color("#ff0000")
+        self.update_channel_status(idx, message, theme.status("fault"))
+        self.ch_ui[idx]["led"].set_color(theme.led("fault"))
         print(f"[Hardware Fault] Channel {idx + 1}: {message}")
         self._triple_bell()
 

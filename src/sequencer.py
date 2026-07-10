@@ -16,18 +16,17 @@ from dataclasses import dataclass
 from typing import List
 
 
-# --- Status / LED colors -------------------------------------------------------
-# These are still raw hex today so the extracted engine reproduces the exact
-# original visuals. A later UI phase can replace them with semantic status kinds
-# that the theme maps to colors; the engine would then emit the kind, not a color.
-C_INIT = "#222222"
-C_OK = "#2e7d32"
-C_FAULT = "#c62828"
-C_RAMP_T = "#1565c0"
-C_RAMP_I = "#7b1fa2"
-LED_RAMP = "#ffdd00"
-LED_OK = "#2e7d32"
-LED_FAULT = "#ff0000"
+# --- Semantic status / LED kinds ----------------------------------------------
+# The engine names *intent*, not color. The GUI (theme.py) maps these kinds to
+# actual colors for the active light/dark theme, keeping this module UI-agnostic.
+C_INIT = "init"
+C_OK = "ok"
+C_FAULT = "fault"
+C_RAMP_T = "ramp_t"
+C_RAMP_I = "ramp_i"
+LED_RAMP = "ramp"
+LED_OK = "ok"
+LED_FAULT = "fault"
 
 
 class SequenceEvents:
@@ -35,11 +34,13 @@ class SequenceEvents:
     the GUI subclasses this (marshalling each call onto the Tk main thread), and
     tests subclass it to record calls."""
 
-    def on_status(self, idx, text, color):
-        """Channel idx's status line should read `text` in `color`."""
+    def on_status(self, idx, text, kind):
+        """Channel idx's status line should read `text`, styled by semantic
+        `kind` ("init"/"ok"/"warn"/"fault"/"ramp_t"/"ramp_i"). The GUI maps the
+        kind to a themed color."""
 
-    def on_led(self, idx, color):
-        """Channel idx's LED should show `color`."""
+    def on_led(self, idx, kind):
+        """Channel idx's LED should show semantic `kind` ("ramp"/"ok"/"fault")."""
 
     def on_live_output(self, idx, kind, state):
         """kind is 'TEC' or 'LAS'; state is 'ON' or 'OFF'."""
