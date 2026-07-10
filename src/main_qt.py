@@ -194,13 +194,16 @@ class QtSequenceEvents(SequenceEvents):
         self.b.fault.emit(idx, message)
 
 
-# Table-mode column spec: (title, min width). Status/Label stretch.
+# Table-mode column spec: (title, fixed width). Column 4 (Status) stretches; all
+# other columns are pinned to these widths in BOTH the header and every row so the
+# labels line up with the data. STATUS_COL is the stretch column.
 TABLE_COLS = [
-    ("Ch", 40), ("On", 30), ("Label", 120), ("", 22), ("Status", 150),
-    ("Live TEC", 64), ("Live LAS", 64), ("Live T", 60), ("Live I", 60),
-    ("Tgt TEC", 68), ("Tgt LAS", 68), ("Tgt T", 60), ("Max", 42),
-    ("Tgt I", 60), ("Max", 42), ("", 86),
+    ("Ch", 42), ("On", 30), ("Label", 120), ("", 22), ("Status", 150),
+    ("Live TEC", 60), ("Live LAS", 60), ("Live T", 58), ("Live I", 58),
+    ("Tgt TEC", 70), ("Tgt LAS", 70), ("Tgt T", 58), ("Max T", 42),
+    ("Tgt I", 58), ("Max I", 42), ("Run", 96),
 ]
+STATUS_COL = 4
 
 
 class ChannelCard(QFrame):
@@ -266,29 +269,34 @@ class ChannelCard(QFrame):
         self._clear()
         for c in self._caps:
             c.setVisible(False)
-        for c, (_, w) in enumerate(TABLE_COLS):
-            self._grid.setColumnMinimumWidth(c, w)
-        self._grid.setColumnStretch(4, 1)   # Status stretches
         g = self._grid
-        g.addWidget(self.num, 0, 0)
-        g.addWidget(self.enable, 0, 1, alignment=Qt.AlignCenter)
-        g.addWidget(self.label, 0, 2)
-        g.addWidget(self.led, 0, 3, alignment=Qt.AlignCenter)
-        g.addWidget(self.status, 0, 4)
-        g.addWidget(self.live_tec, 0, 5)
-        g.addWidget(self.live_las, 0, 6)
-        g.addWidget(self.live_t, 0, 7)
-        g.addWidget(self.live_i, 0, 8)
-        g.addWidget(self.tec_cmd, 0, 9)
-        g.addWidget(self.las_cmd, 0, 10)
-        g.addWidget(self.t_target, 0, 11)
-        g.addWidget(self.max_t, 0, 12)
-        g.addWidget(self.i_target, 0, 13)
-        g.addWidget(self.max_i, 0, 14)
-        g.addWidget(self.run, 0, 15)
+        # widget per column, in TABLE_COLS order
+        order = [self.num, self.enable, self.label, self.led, self.status,
+                 self.live_tec, self.live_las, self.live_t, self.live_i,
+                 self.tec_cmd, self.las_cmd, self.t_target, self.max_t,
+                 self.i_target, self.max_i, self.run]
+        small = {self.enable, self.led}
+        for c, (w, (_, width)) in enumerate(zip(order, TABLE_COLS)):
+            self._grid.setColumnMinimumWidth(c, width)
+            if c == STATUS_COL:
+                w.setMinimumWidth(0); w.setMaximumWidth(16777215)
+            elif w in small:
+                w.setMinimumWidth(0); w.setMaximumWidth(16777215)
+            else:
+                w.setFixedWidth(width)
+            if w in small:
+                g.addWidget(w, 0, c, alignment=Qt.AlignCenter)
+            else:
+                g.addWidget(w, 0, c)
+        self._grid.setColumnStretch(STATUS_COL, 1)
 
     def set_card_mode(self):
         self._clear()
+        # Restore natural sizing (table mode pins widths).
+        for w in (self.num, self.label, self.live_tec, self.live_las, self.live_t,
+                  self.live_i, self.tec_cmd, self.las_cmd, self.t_target,
+                  self.i_target, self.max_t, self.max_i, self.run):
+            w.setMinimumWidth(0); w.setMaximumWidth(16777215)
         for c in self._caps:
             c.setVisible(True)
         for c in range(4):
@@ -428,42 +436,44 @@ class LDCMainWindow(QMainWindow):
 
         self.table_header = self._build_table_header()
         self.cards = [ChannelCard(i, self) for i in range(self.num_channels)]
+        # Parent everything to the scroll container up front and start hidden, so
+        # _relayout only ever adds/removes from the layout and toggles visibility —
+        # never setParent(None), which would briefly turn a card into a top-level
+        # window (the "tiny windows flashing" bug).
+        self.table_header.setParent(self.container); self.table_header.hide()
+        for c in self.cards:
+            c.setParent(self.container); c.hide()
 
-        # --- Bottom panel: [ params + profile ] [ master overrides ] [ run controls ] ---
-        bottom = QHBoxLayout()
-        bottom.setSpacing(16)
+        # --- Bottom panel: two rows. ---
+        bottom = QVBoxLayout(); bottom.setSpacing(8)
 
-        # Left: ramp parameters + profile management.
-        left = QGridLayout(); left.setHorizontalSpacing(8)
-        for r, (lab, attr, default) in enumerate([("T Ramp (°C/s):", "t_ramp", "0.1"),
-                                                  ("I Ramp (mA/s):", "i_ramp", "0.5")]):
-            L = QLabel(lab); L.setObjectName("hdr"); left.addWidget(L, r, 0)
-            e = QLineEdit(default); e.setFixedWidth(80); e.setValidator(QDoubleValidator())
+        # Row 1: ramp params (left) | bulk target presets + EMO + Run/Stop (right)
+        row1 = QHBoxLayout(); row1.setSpacing(12)
+
+        def add_param(label, attr, default):
+            L = QLabel(label); L.setObjectName("hdr"); row1.addWidget(L)
+            e = QLineEdit(default); e.setFixedWidth(72); e.setValidator(QDoubleValidator())
             e.textEdited.connect(self._mark_unsaved)
-            setattr(self, attr, e); left.addWidget(e, r, 1)
-        Lo = QLabel("T OFF Target (°C):"); Lo.setObjectName("hdr"); left.addWidget(Lo, 0, 2)
-        self.t_off = QLineEdit("22.0"); self.t_off.setFixedWidth(80); self.t_off.setValidator(QDoubleValidator())
-        self.t_off.textEdited.connect(self._mark_unsaved)
-        left.addWidget(self.t_off, 0, 3)
-        self.btn_save = QPushButton("💾 Save"); self.btn_save.clicked.connect(self.save_profile)
-        left.addWidget(self.btn_save, 1, 2)
-        self.btn_load = QPushButton("📂 Load"); self.btn_load.clicked.connect(self.load_profile)
-        left.addWidget(self.btn_load, 1, 3)
-        self.btn_clear_prof = QPushButton("❌ Clear"); self.btn_clear_prof.clicked.connect(self.clear_profile)
-        left.addWidget(self.btn_clear_prof, 1, 4)
-        self.lbl_profile = QLabel("Active Profile: [Unsaved]"); self.lbl_profile.setObjectName("caption")
-        left.addWidget(self.lbl_profile, 2, 0, 1, 5)
-        bottom.addLayout(left)
+            setattr(self, attr, e); row1.addWidget(e)
+        add_param("T Ramp (°C/s):", "t_ramp", "0.1")
+        add_param("I Ramp (mA/s):", "i_ramp", "0.5")
+        add_param("T OFF Target (°C):", "t_off", "22.0")
+        row1.addStretch(1)
 
-        # Middle: master overrides — grouped ON/OFF buttons, near the run controls.
-        mid = QVBoxLayout(); mid.setSpacing(4)
-        mlab = QLabel("Master Overrides"); mlab.setObjectName("hdr")
-        mid.addWidget(mlab, alignment=Qt.AlignHCenter)
+        # Bulk target presets: these only SET each channel's Target TEC/LAS; they
+        # do not actuate hardware — the run happens when you press Run All. The
+        # framed group + caption + placement next to Run All make that explicit.
+        preset = QFrame(); preset.setObjectName("card")
+        pv = QVBoxLayout(preset); pv.setContentsMargins(10, 6, 10, 8); pv.setSpacing(3)
+        ph = QLabel("Bulk-set Target TEC / LAS"); ph.setObjectName("hdr")
+        pv.addWidget(ph)
+        pc = QLabel("Sets targets only — press ▶ RUN ALL to apply"); pc.setObjectName("caption")
+        pv.addWidget(pc)
         mgrid = QGridLayout(); mgrid.setSpacing(4)
         self._master_buttons = []
 
         def mkmaster(text, fn, kind, r, c):
-            b = QPushButton(text); b.setEnabled(False); b.setFixedWidth(84); b.clicked.connect(fn)
+            b = QPushButton(text); b.setEnabled(False); b.setFixedWidth(82); b.clicked.connect(fn)
             if kind == "green":
                 b.setStyleSheet("background:#2e7d32; color:white; font-weight:600;")
             elif kind == "red":
@@ -471,27 +481,24 @@ class LDCMainWindow(QMainWindow):
             mgrid.addWidget(b, r, c)
             self._master_buttons.append(b)
 
-        mkmaster("All ON", lambda: self.set_all_systems("ON"), "green", 0, 0)
+        mkmaster("All On", lambda: self.set_all_systems("ON"), "green", 0, 0)
         mkmaster("TEC On", lambda: self.set_all_dropdowns("TEC", "ON"), "", 0, 1)
         mkmaster("LAS On", lambda: self.set_all_dropdowns("LAS", "ON"), "", 0, 2)
-        mkmaster("All OFF", lambda: self.set_all_systems("OFF"), "red", 1, 0)
+        mkmaster("All Off", lambda: self.set_all_systems("OFF"), "red", 1, 0)
         mkmaster("TEC Off", lambda: self.set_all_dropdowns("TEC", "OFF"), "", 1, 1)
         mkmaster("LAS Off", lambda: self.set_all_dropdowns("LAS", "OFF"), "", 1, 2)
-        mid.addLayout(mgrid)
-        bottom.addLayout(mid)
+        pv.addLayout(mgrid)
+        row1.addWidget(preset)
 
-        bottom.addStretch(1)
-
-        # Right: emergency + run/stop.
         self.btn_emo = QPushButton("⚠ EMO OFF"); self.btn_emo.setEnabled(False)
-        self.btn_emo.setFixedWidth(110); self.btn_emo.setMinimumHeight(88)
+        self.btn_emo.setFixedWidth(104); self.btn_emo.setMinimumHeight(92)
         self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; font-weight:bold; border-radius:8px;")
         self.btn_emo.clicked.connect(self.emergency_las_off)
-        bottom.addWidget(self.btn_emo)
+        row1.addWidget(self.btn_emo)
 
         run_col = QVBoxLayout(); run_col.setSpacing(6)
         self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
-        self.btn_run_all.setMinimumHeight(52); self.btn_run_all.setMinimumWidth(220)
+        self.btn_run_all.setMinimumHeight(56); self.btn_run_all.setMinimumWidth(210)
         self.btn_run_all.setStyleSheet("background:#2e7d32; color:white; font-size:16px; font-weight:bold; border-radius:8px;")
         self.btn_run_all.clicked.connect(self.execute_all)
         run_col.addWidget(self.btn_run_all)
@@ -500,7 +507,21 @@ class LDCMainWindow(QMainWindow):
         self.btn_stop.setStyleSheet("background:#c62828; color:white; font-weight:bold; border-radius:8px;")
         self.btn_stop.clicked.connect(self.stop_execution)
         run_col.addWidget(self.btn_stop)
-        bottom.addLayout(run_col)
+        row1.addLayout(run_col)
+        bottom.addLayout(row1)
+
+        # Row 2: profile management — prominent label with its buttons beside it.
+        row2 = QHBoxLayout(); row2.setSpacing(8)
+        self.lbl_profile = QLabel("Active Profile: [Unsaved]"); self.lbl_profile.setObjectName("hdr")
+        row2.addWidget(self.lbl_profile)
+        self.btn_save = QPushButton("💾 Save Profile"); self.btn_save.clicked.connect(self.save_profile)
+        row2.addWidget(self.btn_save)
+        self.btn_load = QPushButton("📂 Load Profile"); self.btn_load.clicked.connect(self.load_profile)
+        row2.addWidget(self.btn_load)
+        self.btn_clear_prof = QPushButton("❌ Clear Profile"); self.btn_clear_prof.clicked.connect(self.clear_profile)
+        row2.addWidget(self.btn_clear_prof)
+        row2.addStretch(1)
+        bottom.addLayout(row2)
 
         root.addLayout(bottom)
 
@@ -510,8 +531,10 @@ class LDCMainWindow(QMainWindow):
         for c, (title, w) in enumerate(TABLE_COLS):
             g.setColumnMinimumWidth(c, w)
             lab = QLabel(title); lab.setObjectName("caption")
+            if c != STATUS_COL:
+                lab.setFixedWidth(w)   # match the row widgets so labels line up
             g.addWidget(lab, 0, c)
-        g.setColumnStretch(4, 1)
+        g.setColumnStretch(STATUS_COL, 1)
         return h
 
     def _connect_bridge(self):
@@ -560,30 +583,29 @@ class LDCMainWindow(QMainWindow):
             return
         self._relayout_key = key
 
-        # detach everything
-        self.table_header.setParent(None)
-        for card in self.cards:
-            card.setParent(None)
+        # Remove all items from the layout (widgets stay children of the container,
+        # so nothing becomes a top-level window / flashes).
         while self.cards_grid.count():
             self.cards_grid.takeAt(0)
         for c in range(max(4, self.cards_grid.columnCount())):
             self.cards_grid.setColumnStretch(c, 0)
 
+        shown_set = set(shown)
         if self._table_mode:
             self.cards_grid.setColumnStretch(0, 1)
             self.cards_grid.addWidget(self.table_header, 0, 0)
-            self.table_header.setParent(self.container); self.table_header.show()
+            self.table_header.setVisible(True)
             for pos, i in enumerate(shown):
                 self.cards_grid.addWidget(self.cards[i], pos + 1, 0)
-                self.cards[i].setParent(self.container); self.cards[i].show()
         else:
-            self.table_header.hide()
+            self.table_header.setVisible(False)
             for c in range(cols):
                 self.cards_grid.setColumnStretch(c, 1)
             for pos, i in enumerate(shown):
                 r, c = divmod(pos, cols)
                 self.cards_grid.addWidget(self.cards[i], r, c)
-                self.cards[i].setParent(self.container); self.cards[i].show()
+        for i in range(self.num_channels):
+            self.cards[i].setVisible(i in shown_set)
 
     def _apply_visibility(self, *_):
         self._relayout(force=True)
@@ -1064,10 +1086,27 @@ class LDCMainWindow(QMainWindow):
         app = QApplication.instance()
         app.setPalette(make_palette(self.dark))
         app.setStyleSheet(build_stylesheet(self.dark))
+        self._style_combo_popups()
         # Re-apply dynamic per-widget colors that the stylesheet doesn't cover.
         for i in range(self.num_channels):
             self._on_live_output(i, "TEC", self.cards[i].live_tec.text())
             self._on_live_output(i, "LAS", self.cards[i].live_las.text())
+
+    def _style_combo_popups(self):
+        """Style each combo's popup list view directly. A global QSS descendant
+        selector does not reliably reach the popup (a separate top-level), which
+        left hovered items as unreadable white-on-white; setting the view's own
+        stylesheet fixes it."""
+        field_bg = "#33373c" if self.dark else "#ffffff"
+        text = "#e6e6e6" if self.dark else "#1a1a1a"
+        qss = (f"QAbstractItemView {{ background: {field_bg}; color: {text}; outline: 0; }}"
+               f"QAbstractItemView::item {{ color: {text}; padding: 3px 6px; min-height: 20px; }}"
+               f"QAbstractItemView::item:selected {{ background: #1976D2; color: #ffffff; }}")
+        combos = [self.com_combo]
+        for c in getattr(self, "cards", []):
+            combos += [c.tec_cmd, c.las_cmd]
+        for combo in combos:
+            combo.view().setStyleSheet(qss)
 
     def _mark_unsaved(self, *_):
         if not self._unsaved:
