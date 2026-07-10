@@ -235,25 +235,39 @@ class ChannelCard(QFrame):
         self.num = QLabel(f"Ch {ch}", self); self.num.setObjectName("chNum")
         self.led = LedDot(parent=self)
         self.enable = QCheckBox(self); self.enable.setEnabled(False)
+        self.enable.setToolTip("Include this channel when you press RUN ALL.")
         self.enable.stateChanged.connect(win._on_enable_changed)
         self.label = QLineEdit(f"Laser {ch}", self); self.label.setEnabled(False)
+        self.label.setToolTip("Custom name for this laser (e.g. its wavelength).")
         self.label.textEdited.connect(win._mark_unsaved)
         self.status = QLabel("Run Scan First", self); self.status.setObjectName("status")
+        self.status.setToolTip("Live status / ramp progress for this channel.")
         self.live_tec = QLabel("OFF", self); self.live_tec.setAlignment(Qt.AlignCenter)
+        self.live_tec.setToolTip("Live TEC (temperature controller) output state.")
         self.live_las = QLabel("OFF", self); self.live_las.setAlignment(Qt.AlignCenter)
+        self.live_las.setToolTip("Live laser current-source output state.")
         self.live_t = QLabel("0.0", self); self.live_t.setObjectName("reading"); self.live_t.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.live_t.setToolTip("Live measured temperature (°C).")
         self.live_i = QLabel("0.0", self); self.live_i.setObjectName("reading"); self.live_i.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.live_i.setToolTip("Live measured laser current (mA).")
         self.tec_cmd = QComboBox(self); self.tec_cmd.addItems(["ON", "OFF"]); self.tec_cmd.setCurrentText("OFF"); self.tec_cmd.setEnabled(False)
+        self.tec_cmd.setToolTip("Target TEC state to apply when this channel runs.")
         self.tec_cmd.currentTextChanged.connect(win._mark_unsaved)
         self.las_cmd = QComboBox(self); self.las_cmd.addItems(["ON", "OFF"]); self.las_cmd.setCurrentText("OFF"); self.las_cmd.setEnabled(False)
+        self.las_cmd.setToolTip("Target laser state to apply when this channel runs (needs TEC ON).")
         self.las_cmd.currentTextChanged.connect(win._mark_unsaved)
         self.t_target = QLineEdit("22.0", self); self.t_target.setEnabled(False); self.t_target.setValidator(QDoubleValidator())
+        self.t_target.setToolTip("Target temperature to ramp to (°C).")
         self.t_target.textEdited.connect(win._mark_unsaved)
         self.i_target = QLineEdit("0.0", self); self.i_target.setEnabled(False); self.i_target.setValidator(QDoubleValidator())
+        self.i_target.setToolTip("Target laser current to ramp to (mA).")
         self.i_target.textEdited.connect(win._mark_unsaved)
         self.max_t = QLabel("-", self); self.max_t.setObjectName("caption"); self.max_t.setAlignment(Qt.AlignCenter)
+        self.max_t.setToolTip("Hardware high-temperature limit read from the card.")
         self.max_i = QLabel("-", self); self.max_i.setObjectName("caption"); self.max_i.setAlignment(Qt.AlignCenter)
+        self.max_i.setToolTip("Hardware current limit read from the card.")
         self.run = QPushButton("▶ Run Ch.", self); self.run.setEnabled(False)
+        self.run.setToolTip("Run just this one channel to its targets now.")
         self.run.clicked.connect(lambda: win.execute_channels([ch]))
 
         # Captions shown only in Cards view (Table view has a shared header).
@@ -399,17 +413,23 @@ class LDCMainWindow(QMainWindow):
         lbl = QLabel("COM Port:"); lbl.setObjectName("hdr")
         top.addWidget(lbl)
         self.com_combo = QComboBox(); self.com_combo.setMinimumWidth(190)
+        self.com_combo.setToolTip("Serial port of the LDC-3908, or 'Demo Simulator' to explore the app offline.")
         self._refresh_ports()
         top.addWidget(self.com_combo)
         self.btn_refresh = QPushButton("↻"); self.btn_refresh.setFixedWidth(34)
+        self.btn_refresh.setToolTip("Rescan the computer for available serial ports.")
         self.btn_refresh.clicked.connect(self._refresh_ports)
         top.addWidget(self.btn_refresh)
         self.btn_connect = QPushButton("Connect"); self.btn_connect.clicked.connect(self.connect_serial)
+        self.btn_connect.setToolTip("Open or close the connection to the selected port.")
         top.addWidget(self.btn_connect)
         self.btn_scan = QPushButton("Scan Channels"); self.btn_scan.setEnabled(False)
+        self.btn_scan.setToolTip("Interrogate all 8 slots: find installed laser cards, read their\n"
+                                 "current/temperature limits, and match the controls to the hardware.")
         self.btn_scan.clicked.connect(self.start_scan)
         top.addWidget(self.btn_scan)
         self.btn_clear = QPushButton("Clear Faults"); self.btn_clear.setEnabled(False)
+        self.btn_clear.setToolTip("Clear latched chassis fault codes, then rescan the channels.")
         self.btn_clear.clicked.connect(self.clear_faults)
         top.addWidget(self.btn_clear)
         top.addStretch(1)
@@ -426,15 +446,18 @@ class LDCMainWindow(QMainWindow):
         bar.addStretch(1)
 
         self.btn_view_table = QPushButton("Table"); self.btn_view_table.setObjectName("seg"); self.btn_view_table.setCheckable(True); self.btn_view_table.setChecked(True)
+        self.btn_view_table.setToolTip("Table view: one aligned row per channel.")
         self.btn_view_cards = QPushButton("Cards"); self.btn_view_cards.setObjectName("seg"); self.btn_view_cards.setCheckable(True)
+        self.btn_view_cards.setToolTip("Card view: a reflowing grid of one card per channel.")
         grp = QButtonGroup(self); grp.setExclusive(True); grp.addButton(self.btn_view_table); grp.addButton(self.btn_view_cards)
-        self.btn_view_table.clicked.connect(lambda: self._set_view_mode(True))
-        self.btn_view_cards.clicked.connect(lambda: self._set_view_mode(False))
+        self.btn_view_table.clicked.connect(lambda: (self._set_view_mode(True), self._mark_unsaved()))
+        self.btn_view_cards.clicked.connect(lambda: (self._set_view_mode(False), self._mark_unsaved()))
         seg = QHBoxLayout(); seg.setSpacing(0); seg.addWidget(self.btn_view_table); seg.addWidget(self.btn_view_cards)
         bar.addLayout(seg)
         bar.addSpacing(14)
 
         self.chk_show_unused = QCheckBox("Show unused")
+        self.chk_show_unused.setToolTip("Also show empty slots, no-laser cards, and disabled channels.")
         self.chk_show_unused.stateChanged.connect(self._apply_visibility)
         bar.addWidget(self.chk_show_unused)
         root.addLayout(bar)
@@ -470,14 +493,18 @@ class LDCMainWindow(QMainWindow):
         left.addStretch(1)
         params = QHBoxLayout(); params.setSpacing(8)
 
-        def add_param(label, attr, default):
-            L = QLabel(label); L.setObjectName("hdr"); params.addWidget(L)
+        def add_param(label, attr, default, tip):
+            L = QLabel(label); L.setObjectName("hdr"); L.setToolTip(tip); params.addWidget(L)
             e = QLineEdit(default); e.setFixedWidth(72); e.setValidator(QDoubleValidator())
+            e.setToolTip(tip)
             e.textEdited.connect(self._mark_unsaved)
             setattr(self, attr, e); params.addWidget(e)
-        add_param("T Ramp (°C/s):", "t_ramp", "0.1")
-        add_param("I Ramp (mA/s):", "i_ramp", "0.5")
-        add_param("T OFF Target (°C):", "t_off", "22.0")
+        add_param("T Ramp (°C/s):", "t_ramp", "0.1",
+                  "How fast the temperature setpoint is ramped, in °C per second (slower is gentler on the diode).")
+        add_param("I Ramp (mA/s):", "i_ramp", "0.5",
+                  "How fast the laser current is ramped, in mA per second.")
+        add_param("T OFF Target (°C):", "t_off", "22.0",
+                  "Temperature the TEC is ramped to before it is switched OFF.")
         params.addStretch(1)
         left.addLayout(params)
 
@@ -485,10 +512,13 @@ class LDCMainWindow(QMainWindow):
         self.lbl_profile = QLabel("Active Profile: [Unsaved]"); self.lbl_profile.setObjectName("hdr")
         profile.addWidget(self.lbl_profile)
         self.btn_save = QPushButton("💾 Save Profile"); self.btn_save.clicked.connect(self.save_profile)
+        self.btn_save.setToolTip("Save all targets, ramp rates, ramp mode, and view to a profile file.")
         profile.addWidget(self.btn_save)
         self.btn_load = QPushButton("📂 Load Profile"); self.btn_load.clicked.connect(self.load_profile)
+        self.btn_load.setToolTip("Load targets, ramp rates, ramp mode, and view from a profile file.")
         profile.addWidget(self.btn_load)
         self.btn_clear_prof = QPushButton("❌ Clear Profile"); self.btn_clear_prof.clicked.connect(self.clear_profile)
+        self.btn_clear_prof.setToolTip("Reset all targets and settings to defaults.")
         profile.addWidget(self.btn_clear_prof)
         profile.addStretch(1)
         left.addLayout(profile)
@@ -509,8 +539,9 @@ class LDCMainWindow(QMainWindow):
         mgrid = QGridLayout(); mgrid.setSpacing(4)
         self._master_buttons = []
 
-        def mkmaster(text, fn, kind, r, c):
+        def mkmaster(text, fn, kind, r, c, tip):
             b = QPushButton(text); b.setEnabled(False); b.setFixedWidth(82); b.clicked.connect(fn)
+            b.setToolTip(tip)
             if kind == "green":
                 b.setStyleSheet("background:#2e7d32; color:white; font-weight:600;")
             elif kind == "red":
@@ -518,12 +549,18 @@ class LDCMainWindow(QMainWindow):
             mgrid.addWidget(b, r, c)
             self._master_buttons.append(b)
 
-        mkmaster("All On", lambda: self.set_all_systems("ON"), "green", 0, 0)
-        mkmaster("TEC On", lambda: self.set_all_dropdowns("TEC", "ON"), "", 0, 1)
-        mkmaster("LAS On", lambda: self.set_all_dropdowns("LAS", "ON"), "", 0, 2)
-        mkmaster("All Off", lambda: self.set_all_systems("OFF"), "red", 1, 0)
-        mkmaster("TEC Off", lambda: self.set_all_dropdowns("TEC", "OFF"), "", 1, 1)
-        mkmaster("LAS Off", lambda: self.set_all_dropdowns("LAS", "OFF"), "", 1, 2)
+        mkmaster("All On", lambda: self.set_all_systems("ON"), "green", 0, 0,
+                 "Set every channel's Target TEC and Target LAS to ON.")
+        mkmaster("TEC On", lambda: self.set_all_dropdowns("TEC", "ON"), "", 0, 1,
+                 "Set every channel's Target TEC to ON.")
+        mkmaster("LAS On", lambda: self.set_all_dropdowns("LAS", "ON"), "", 0, 2,
+                 "Set every channel's Target LAS to ON.")
+        mkmaster("All Off", lambda: self.set_all_systems("OFF"), "red", 1, 0,
+                 "Set every channel's Target TEC and Target LAS to OFF.")
+        mkmaster("TEC Off", lambda: self.set_all_dropdowns("TEC", "OFF"), "", 1, 1,
+                 "Set every channel's Target TEC to OFF.")
+        mkmaster("LAS Off", lambda: self.set_all_dropdowns("LAS", "OFF"), "", 1, 2,
+                 "Set every channel's Target LAS to OFF.")
         pv.addLayout(mgrid)
         bottom.addWidget(preset)
 
@@ -531,6 +568,8 @@ class LDCMainWindow(QMainWindow):
         self.btn_emo.setFixedWidth(140); self.btn_emo.setMinimumHeight(92)
         self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; "
                                    "font-weight:bold; border-radius:8px; padding:6px 8px;")
+        self.btn_emo.setToolTip("EMERGENCY: immediately cut laser current on every channel, bypassing the\n"
+                                "ramp-down. Use only in a genuine emergency — for normal stops use Cancel Run.")
         self.btn_emo.clicked.connect(self.emergency_las_off)
         bottom.addWidget(self.btn_emo)
 
@@ -550,14 +589,23 @@ class LDCMainWindow(QMainWindow):
             "All lasers at once: ramp every channel simultaneously (fastest).")
         self.mode_combo.currentIndexChanged.connect(self._mark_unsaved)
         run_col.addWidget(self.mode_combo)
+        # Prominent, always-visible estimate for the selected mode (the per-mode
+        # figures are also in each dropdown item for comparison).
+        self.lbl_eta = QLabel("Est. run time: — (scan & set targets)")
+        self.lbl_eta.setObjectName("hdr")
+        self.lbl_eta.setToolTip("Approximate time to complete the run in the selected mode. "
+                                "Populates after a scan once channels have targets.")
+        run_col.addWidget(self.lbl_eta)
         self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
         self.btn_run_all.setMinimumHeight(48); self.btn_run_all.setMinimumWidth(280)
         self.btn_run_all.setStyleSheet("background:#2e7d32; color:white; font-size:16px; font-weight:bold; border-radius:8px;")
+        self.btn_run_all.setToolTip("Run every enabled channel to its targets using the selected ramp mode.")
         self.btn_run_all.clicked.connect(self.execute_all)
         run_col.addWidget(self.btn_run_all)
         self.btn_stop = QPushButton("⏹ CANCEL RUN (Safe)"); self.btn_stop.setEnabled(False)
         self.btn_stop.setMinimumHeight(30)
         self.btn_stop.setStyleSheet("background:#c62828; color:white; font-weight:bold; border-radius:8px;")
+        self.btn_stop.setToolTip("Safely halt the run: stops ramping and holds each channel at its last setpoint.")
         self.btn_stop.clicked.connect(self.stop_execution)
         run_col.addWidget(self.btn_stop)
         bottom.addLayout(run_col)
@@ -1035,6 +1083,12 @@ class LDCMainWindow(QMainWindow):
                 self.mode_combo.setItemText(idx, f"{names[idx]}  (~{int(secs // 60)}:{int(secs % 60):02d})")
             else:
                 self.mode_combo.setItemText(idx, names[idx])
+        if hasattr(self, "lbl_eta"):
+            if est:
+                secs = est[self._MODE_KEYS[self.mode_combo.currentIndex()]]
+                self.lbl_eta.setText(f"Est. run time: ~{int(secs // 60)}:{int(secs % 60):02d}")
+            else:
+                self.lbl_eta.setText("Est. run time: — (scan & set targets)")
 
     def _run_sequence(self, plans, t_ramp, i_ramp, t_off, mode):
         self.sequence_start_time = time.time()
@@ -1202,7 +1256,8 @@ class LDCMainWindow(QMainWindow):
             data = {"COM_Port": self.com_combo.currentText(),
                     "T_ramp": float(self.t_ramp.text()), "I_ramp": float(self.i_ramp.text()),
                     "T_OFF_Target": float(self.t_off.text()),
-                    "Ramp_Mode": self._selected_mode(), "channels": []}
+                    "Ramp_Mode": self._selected_mode(),
+                    "View_Mode": "table" if self._table_mode else "cards", "channels": []}
             for c in self.cards:
                 data["channels"].append({"T_Target": float(c.t_target.text() or 0),
                                          "I_Target": float(c.i_target.text() or 0),
@@ -1233,6 +1288,10 @@ class LDCMainWindow(QMainWindow):
                 self.mode_combo.blockSignals(True)
                 self.mode_combo.setCurrentIndex(self._MODE_KEYS.index(mode))
                 self.mode_combo.blockSignals(False)
+            table = data.get("View_Mode", "table") != "cards"
+            self.btn_view_table.setChecked(table)
+            self.btn_view_cards.setChecked(not table)
+            self._set_view_mode(table)
             for k, cfg in enumerate(data["channels"][:self.num_channels]):
                 self.cards[k].t_target.setText(str(cfg["T_Target"]))
                 self.cards[k].i_target.setText(str(cfg["I_Target"]))
@@ -1254,6 +1313,9 @@ class LDCMainWindow(QMainWindow):
         self.mode_combo.blockSignals(True)
         self.mode_combo.setCurrentIndex(0)  # back to "One laser at a time"
         self.mode_combo.blockSignals(False)
+        self.btn_view_table.setChecked(True)
+        self.btn_view_cards.setChecked(False)
+        self._set_view_mode(True)
         for k, c in enumerate(self.cards):
             c.t_target.setText("22.0"); c.i_target.setText("0.0"); c.label.setText(f"Laser {k + 1}")
         try:

@@ -235,6 +235,35 @@ def test_parallel_fault_in_one_channel_aborts_run():
     assert any(e[0] == "fault" for e in ev.events)
 
 
+_DIFF_TARGETS = {0: (30.0, 32.5), 1: (31.5, 45.0), 4: (25.5, 12.0)}  # per-channel (T, I)
+
+
+def _diff_plans():
+    return [ChannelPlan(idx=i, ch_num=n, tec_cmd="ON", las_cmd="ON",
+                        t_target=_DIFF_TARGETS[i][0], i_target=_DIFF_TARGETS[i][1], targets_valid=True)
+            for i, n in _INSTALLED]
+
+
+def test_parallel_reaches_distinct_setpoints():
+    c, ev, seq = _rig()
+    seq.run(_diff_plans(), FAST_T, FAST_I, 22.0, mode="parallel")
+    for i, _ in _INSTALLED:
+        tt, ti = _DIFF_TARGETS[i]
+        assert abs(c.sim_state['T_actual'][i] - tt) < 0.1, (i, c.sim_state['T_actual'][i])
+        assert abs(c.sim_state['I_actual'][i] - ti) < 0.1, (i, c.sim_state['I_actual'][i])
+    assert not c.is_stop_requested
+
+
+def test_stage_reaches_distinct_setpoints():
+    c, ev, seq = _rig()
+    seq.run(_diff_plans(), FAST_T, FAST_I, 22.0, mode="stage")
+    for i, _ in _INSTALLED:
+        tt, ti = _DIFF_TARGETS[i]
+        assert abs(c.sim_state['T_actual'][i] - tt) < 0.1, (i, c.sim_state['T_actual'][i])
+        assert abs(c.sim_state['I_actual'][i] - ti) < 0.1, (i, c.sim_state['I_actual'][i])
+    assert not c.is_stop_requested
+
+
 def test_estimate_parallel_is_faster_than_sequential():
     infos = [dict(curr_t=22.0, curr_i=0.0, t_target=40.0, i_target=60.0,
                   tec_cmd="ON", las_cmd="ON", live_tec="OFF", live_las="OFF")
