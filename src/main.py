@@ -21,23 +21,21 @@ import sys
 import threading
 import time
 
-from PySide6.QtCore import Qt, QObject, Signal, QTimer
-from PySide6.QtGui import QColor, QPalette, QPainter, QBrush, QIcon, QDoubleValidator
+from PySide6.QtCore import Qt, QObject, Signal, QTimer, QMimeData, QPoint
+from PySide6.QtGui import (QColor, QPalette, QPainter, QBrush, QIcon, QDoubleValidator,
+                           QAction, QDrag)
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QLineEdit,
     QCheckBox, QFrame, QHBoxLayout, QVBoxLayout, QGridLayout, QMessageBox,
-    QFileDialog, QScrollArea, QButtonGroup,
+    QFileDialog, QScrollArea, QButtonGroup, QDialog, QDialogButtonBox, QFormLayout,
+    QListWidget, QInputDialog, QMenu,
 )
 
 import serial.tools.list_ports
 
-from ldc3908 import LDC3908Driver
 from sequencer import Sequencer, SequenceEvents, ChannelPlan, estimate_run_times
+import system as sysmod
 import theme
-
-# The controller driver the app uses. Swap this for another
-# LaserControllerDriver subclass to support a different controller.
-DRIVER_CLASS = LDC3908Driver
 
 PREF_FILE = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
 CARD_W = 300  # logical px; approx one compact card width incl. margins
@@ -98,6 +96,13 @@ def build_stylesheet(dark):
         border: 1px solid {card_border};
         border-radius: 8px;
     }}
+    QFrame#unitBox {{
+        background: {header_bg};
+        border: 1px solid {card_border};
+        border-radius: 10px;
+    }}
+    QLabel#unitTitle {{ font-size: 13px; font-weight: 700; }}
+    QLabel#unitMeta {{ color: {muted}; font-size: 11px; }}
     QLabel#chNum {{ font-size: 15px; font-weight: 600; }}
     QLabel#caption {{ color: {muted}; font-size: 11px; }}
     QLabel#hdr {{ font-weight: 600; }}
@@ -223,10 +228,11 @@ class ChannelCard(QFrame):
     """One channel's controls. The SAME widgets are re-laid out for Table view
     (a full-width horizontal row) and Cards view (a compact vertical block)."""
 
-    def __init__(self, idx, win):
+    def __init__(self, idx, win, binding=None):
         super().__init__()
         self.idx = idx
         self.win = win
+        self.binding = binding
         self.setObjectName("card")
         self._grid = QGridLayout(self)
         self._grid.setContentsMargins(10, 8, 10, 8)
@@ -237,13 +243,15 @@ class ChannelCard(QFrame):
         # child were left parentless, _clear()'s setVisible(True) would turn it
         # into a floating top-level window (the "tiny windows flashing" bug, seen
         # as QWindowsWindow::setGeometry warnings on *Window objects).
-        ch = idx + 1
+        ch = binding.ch_num if binding is not None else idx + 1
+        default_label = (binding.label if binding is not None and binding.label
+                         else f"Laser {ch}")
         self.num = QLabel(f"Ch {ch}", self); self.num.setObjectName("chNum")
         self.led = LedDot(parent=self)
         self.enable = QCheckBox(self); self.enable.setEnabled(False)
         self.enable.setToolTip("Include this channel when you press RUN ALL.")
         self.enable.stateChanged.connect(win._on_enable_changed)
-        self.label = QLineEdit(f"Laser {ch}", self); self.label.setEnabled(False)
+        self.label = QLineEdit(default_label, self); self.label.setEnabled(False)
         self.label.setToolTip("Custom name for this laser (e.g. its wavelength).")
         self.label.textEdited.connect(win._mark_unsaved)
         self.status = QLabel("Run Scan First", self); self.status.setObjectName("status")
@@ -274,7 +282,7 @@ class ChannelCard(QFrame):
         self.max_i.setToolTip("Hardware current limit read from the card.")
         self.run = QPushButton("▶ Run Ch.", self); self.run.setEnabled(False)
         self.run.setToolTip("Run just this one channel to its targets now.")
-        self.run.clicked.connect(lambda: win.execute_channels([ch]))
+        self.run.clicked.connect(lambda: win.execute_channels([self.idx]))
 
         # Captions shown only in Cards view (Table view has a shared header).
         self._caps = [QLabel(t, self) for t in
@@ -349,20 +357,337 @@ class ChannelCard(QFrame):
         g.addWidget(self.max_t, 6, 2); g.addWidget(self.max_i, 6, 3)
         g.addWidget(self.run, 7, 0, 1, 4)
 
+    # --- drag to reorder channels within a controller ---
+    # (Child controls consume their own mouse events, so a drag only starts from
+    # the card background / the "Ch N" label — editing fields still works.)
+    def mousePressEvent(self, e):
+        self._press = e.position().toPoint() if e.button() == Qt.LeftButton else None
+
+    def mouseMoveEvent(self, e):
+        if getattr(self, "_press", None) is None or not (e.buttons() & Qt.LeftButton):
+            return
+        if (e.position().toPoint() - self._press).manhattanLength() < 12:
+            return
+        drag = QDrag(self)
+        mime = QMimeData(); mime.setText(f"chan:{self.idx}")
+        drag.setMimeData(mime)
+        drag.exec(Qt.MoveAction)
+        self._press = None
+
+
+class UnitBox(QFrame):
+    """One controller (or T+I pairing) drawn as a titled box; its channel cards
+    live inside. All boxes stack in the same scroll area, so multiple controllers
+    read as one table split into boxes. The header can be renamed (double-click),
+    dragged to reorder controllers, or right-clicked for rename/edit/delete/move.
+    Channel cards dropped inside reorder the channels within this controller."""
+
+    def __init__(self, unit, win):
+        super().__init__()
+        self.unit = unit
+        self.win = win
+        self.setObjectName("unitBox")
+        self.setAcceptDrops(True)
+        self._press = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(8, 6, 8, 8)
+        v.setSpacing(4)
+        self.head = QWidget()
+        head = QHBoxLayout(self.head); head.setContentsMargins(0, 0, 0, 0); head.setSpacing(8)
+        self.handle = QLabel("⠿"); self.handle.setObjectName("unitMeta")
+        head.addWidget(self.handle)
+        self.title = QLabel(unit.title); self.title.setObjectName("unitTitle")
+        self.title.setToolTip("Double-click to rename; right-click for options; drag to reorder.")
+        head.addWidget(self.title)
+        self.meta = QLabel(""); self.meta.setObjectName("unitMeta")
+        head.addWidget(self.meta)
+        head.addStretch(1)
+        # Per-controller Scan (only for multi-channel controllers) + Connect.
+        self.btn_scan = QPushButton("Scan"); self.btn_scan.setFixedWidth(72)
+        self.btn_scan.setToolTip("Re-interrogate this controller's channels for attached lasers.")
+        self.btn_scan.clicked.connect(lambda: self.win._rescan_unit(self.unit.id))
+        self.btn_scan.setVisible(False)
+        head.addWidget(self.btn_scan)
+        self.btn_conn = QPushButton("Connect"); self.btn_conn.setFixedWidth(100)
+        self.btn_conn.setToolTip("Connect or disconnect this controller.")
+        self.btn_conn.clicked.connect(lambda: self.win._toggle_unit_connect(self.unit.id))
+        head.addWidget(self.btn_conn)
+        v.addWidget(self.head)
+        # Body holds this unit's channel cards (placed by _relayout).
+        self.body = QWidget()
+        self.grid = QGridLayout(self.body)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setHorizontalSpacing(8)
+        self.grid.setVerticalSpacing(8)
+        self.grid.setAlignment(Qt.AlignTop)
+        v.addWidget(self.body)
+
+    def set_meta(self, text):
+        self.meta.setText(text)
+
+    def enable_scan(self, on):
+        self.btn_scan.setVisible(on)
+
+    def set_connected(self, connected):
+        self.btn_conn.setText("Disconnect" if connected else "Connect")
+        self.btn_scan.setEnabled(connected)
+
+    def _on_header(self, y):
+        return y <= self.head.height() + 6
+
+    # --- rename / context menu ---
+    def mouseDoubleClickEvent(self, e):
+        if self._on_header(e.position().y()):
+            self.win._rename_unit(self.unit.id)
+
+    def contextMenuEvent(self, e):
+        m = QMenu(self)
+        a_ren = m.addAction("Rename…")
+        a_edit = m.addAction("Edit connection / settings…")
+        m.addSeparator()
+        a_up = m.addAction("Move up")
+        a_down = m.addAction("Move down")
+        m.addSeparator()
+        a_del = m.addAction("Delete controller")
+        act = m.exec(e.globalPos())
+        if act == a_ren:
+            self.win._rename_unit(self.unit.id)
+        elif act == a_edit:
+            self.win._edit_unit(self.unit.id)
+        elif act == a_up:
+            self.win._move_unit(self.unit.id, -1)
+        elif act == a_down:
+            self.win._move_unit(self.unit.id, +1)
+        elif act == a_del:
+            self.win._delete_unit(self.unit.id)
+
+    # --- drag to reorder controllers (grab the header) ---
+    def mousePressEvent(self, e):
+        self._press = e.position().toPoint() if (
+            e.button() == Qt.LeftButton and self._on_header(e.position().y())) else None
+
+    def mouseMoveEvent(self, e):
+        if self._press is None or not (e.buttons() & Qt.LeftButton):
+            return
+        if (e.position().toPoint() - self._press).manhattanLength() < 12:
+            return
+        drag = QDrag(self)
+        mime = QMimeData(); mime.setText(f"unit:{self.unit.id}")
+        drag.setMimeData(mime)
+        drag.exec(Qt.MoveAction)
+        self._press = None
+
+    def dragEnterEvent(self, e):
+        t = e.mimeData().text() if e.mimeData().hasText() else ""
+        if t.startswith("unit:") or t.startswith("chan:"):
+            e.acceptProposedAction()
+
+    def dragMoveEvent(self, e):
+        self.dragEnterEvent(e)
+
+    def dropEvent(self, e):
+        t = e.mimeData().text() if e.mimeData().hasText() else ""
+        if t.startswith("unit:"):
+            before = e.position().y() < self.height() / 2
+            self.win._reorder_units(t[5:], self.unit.id, before)
+            e.acceptProposedAction()
+        elif t.startswith("chan:"):
+            self.win._drop_channel(int(t[5:]), self.unit.id,
+                                   self.mapToGlobal(e.position().toPoint()))
+            e.acceptProposedAction()
+
+
+# Combined single-device controller types offered in the Hardware dialog.
+_COMBINED_TYPES = [("ldc3908", "ILX Lightwave LDC-3908 (8 channels)"),
+                   ("thorlabs_itc", "Thorlabs ITC (combined, 1 channel)")]
+
+
+def pick_transport(parent, ports, title, current=None):
+    """Modal picker for a device connection. Returns a transport spec dict
+    ({"type": "sim"|"serial"|"visa", ...}) or None if cancelled. `current`
+    pre-selects the existing connection when editing."""
+    d = QDialog(parent); d.setWindowTitle(title)
+    f = QFormLayout(d)
+    kind = QComboBox(); kind.addItems(["Demo Simulator", "Serial port", "USB / VISA resource"])
+    f.addRow("Connection:", kind)
+    port = QComboBox(); port.addItems(list(ports))
+    f.addRow("Serial port:", port)
+    res = QLineEdit(); res.setPlaceholderText("e.g. USB0::0x1313::0x8080::M00...::INSTR")
+    f.addRow("VISA resource:", res)
+    cur = current or {"type": "sim"}
+    ct = cur.get("type", "sim")
+    if ct == "serial":
+        kind.setCurrentIndex(1)
+        p = cur.get("port", "")
+        if p and p not in ports:
+            port.addItem(p)
+        port.setCurrentText(p)
+    elif ct == "visa":
+        kind.setCurrentIndex(2); res.setText(cur.get("resource", ""))
+    else:
+        kind.setCurrentIndex(0)
+    bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+    bb.accepted.connect(d.accept); bb.rejected.connect(d.reject)
+    f.addRow(bb)
+
+    def upd():
+        port.setEnabled(kind.currentIndex() == 1)
+        res.setEnabled(kind.currentIndex() == 2)
+    kind.currentIndexChanged.connect(upd); upd()
+    if d.exec() != QDialog.Accepted:
+        return None
+    i = kind.currentIndex()
+    if i == 1:
+        return {"type": "serial", "port": port.currentText()}
+    if i == 2:
+        return {"type": "visa", "resource": res.text().strip()}
+    return {"type": "sim"}
+
+
+class HardwareDialog(QDialog):
+    """Compose the controller layout: add combined controllers or Wavelength
+    temperature+current pairings, each with its own connection (Demo / serial /
+    USB-VISA). Produces a config dict consumed by system.build_system()."""
+
+    def __init__(self, win, config):
+        super().__init__(win)
+        self._win = win
+        self.setWindowTitle("Hardware Configuration")
+        self.setMinimumWidth(600)
+        # Work on a copy so Cancel discards changes.
+        self.units = [json.loads(json.dumps(u)) for u in (config or {}).get("units", [])]
+
+        v = QVBoxLayout(self)
+        v.addWidget(QLabel("Each controller (or T+I pairing) is one box in the table:"))
+        self.listw = QListWidget()
+        v.addWidget(self.listw, 1)
+        row = QHBoxLayout()
+        b_add = QPushButton("Add controller…"); b_add.clicked.connect(self._add_combined)
+        b_pair = QPushButton("Add Wavelength T+I pair…"); b_pair.clicked.connect(self._add_pair)
+        b_del = QPushButton("Remove selected"); b_del.clicked.connect(self._remove)
+        row.addWidget(b_add); row.addWidget(b_pair); row.addWidget(b_del); row.addStretch(1)
+        v.addLayout(row)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
+        v.addWidget(bb)
+        self._refresh()
+
+    # --- rendering ---
+    def _refresh(self):
+        self.listw.clear()
+        for u in self.units:
+            self.listw.addItem(self._describe(u))
+
+    @staticmethod
+    def _tl(spec):
+        spec = spec or {"type": "sim"}
+        t = spec.get("type")
+        return {"sim": "Demo", "serial": spec.get("port", "serial"),
+                "visa": spec.get("resource", "USB")}.get(t, t)
+
+    def _describe(self, u):
+        if u.get("kind") == "pairing":
+            return (f"{u.get('title', 'Pair')}  —  TEC via {self._tl(u['temp'].get('transport'))}"
+                    f",  current via {self._tl(u['current'].get('transport'))}")
+        return f"{u.get('title', u.get('driver'))}  [{u.get('driver')}]  —  {self._tl(u.get('transport'))}"
+
+    def _new_id(self):
+        existing = {u.get("id") for u in self.units}
+        n = 1
+        while f"u{n}" in existing:
+            n += 1
+        return f"u{n}"
+
+    # --- transport picker ---
+    def _pick_transport(self, title, current=None):
+        return pick_transport(self, self._win._available_ports(), title, current)
+
+    # --- add / remove ---
+    def _add_combined(self):
+        d = QDialog(self); d.setWindowTitle("Add controller")
+        f = QFormLayout(d)
+        dtype = QComboBox()
+        for key, label in _COMBINED_TYPES:
+            dtype.addItem(label, key)
+        f.addRow("Controller:", dtype)
+        title = QLineEdit(); f.addRow("Name:", title)
+        # Pre-fill the name with the controller's default model, and keep it in
+        # sync with the selected type until the user edits it themselves.
+        def default_name():
+            return sysmod.driver_class(dtype.currentData()).model
+        title.setText(default_name())
+        title._edited = False
+        title.textEdited.connect(lambda *_: setattr(title, "_edited", True))
+        dtype.currentIndexChanged.connect(
+            lambda *_: (None if title._edited else title.setText(default_name())))
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(d.accept); bb.rejected.connect(d.reject)
+        f.addRow(bb)
+        if d.exec() != QDialog.Accepted:
+            return
+        spec = self._pick_transport(f"Connection for {dtype.currentText()}")
+        if spec is None:
+            return
+        self.units.append({"id": self._new_id(), "kind": "combined",
+                           "driver": dtype.currentData(),
+                           "title": title.text().strip() or dtype.currentText(),
+                           "transport": spec})
+        self._refresh()
+
+    def _add_pair(self):
+        default = f"{sysmod.driver_class('wavelength_tc').model} + {sysmod.driver_class('wavelength_qcl').model}"
+        title, ok = QInputDialog.getText(self, "Add Wavelength pair",
+                                         "Name for this laser line:", text=default)
+        if not ok:
+            return
+        tspec = self._pick_transport("Temperature (Wavelength TC) connection")
+        if tspec is None:
+            return
+        cspec = self._pick_transport("Current (Wavelength QCL) connection")
+        if cspec is None:
+            return
+        self.units.append({"id": self._new_id(), "kind": "pairing",
+                           "title": title.strip() or "Wavelength Laser",
+                           "temp": {"driver": "wavelength_tc", "transport": tspec},
+                           "current": {"driver": "wavelength_qcl", "transport": cspec}})
+        self._refresh()
+
+    def _remove(self):
+        r = self.listw.currentRow()
+        if 0 <= r < len(self.units):
+            del self.units[r]
+            self._refresh()
+
+    def result_config(self):
+        return {"units": self.units}
+
 
 class LDCMainWindow(QMainWindow):
+    @property
+    def num_channels(self):
+        return self.system.num_channels
+
+    @property
+    def channels(self):
+        return self.system.channels
+
     def __init__(self):
         super().__init__()
-        self.driver = DRIVER_CLASS()
-        self.num_channels = self.driver.num_channels
         self.bridge = QtBridge()
-        self.seq = Sequencer(self.driver, events=QtSequenceEvents(self.bridge))
+        # Hardware layout: which controllers, their transports, and any T+I
+        # pairings. This config is the source of truth; build_system() turns it
+        # into a ControllerSystem (devices + units + flat channel bindings).
+        # Default: one ILX LDC-3908 in Demo mode, so the app starts usable offline.
+        self.config = sysmod.default_config()
+        self.system = sysmod.build_system(self.config)
+        self.seq = Sequencer(stop=self.system.stop, events=QtSequenceEvents(self.bridge))
 
         self.is_executing = False
         self.is_scanning = False
         self.is_closing = False
         self.has_scanned = False
-        self.populated = [False] * self.num_channels
+        self._unit_scanned = {}     # uid -> bool (scanned since last connect)
+        self.populated = [False] * self.system.num_channels
         self.total_estimated_time = 0.0
         self.sequence_start_time = None
         self.telemetry_active = False
@@ -373,7 +698,7 @@ class LDCMainWindow(QMainWindow):
         self._unsaved = False
         self._MODE_KEYS = ("sequential", "stage", "parallel")
         self._MODE_NAMES = ("One laser at a time",
-                            "All temps, then currents",
+                            "All channels, stage by stage",
                             "All lasers at once")
         # Follow the OS light/dark theme (Qt 6.5+), and track live changes.
         hints = QApplication.instance().styleHints()
@@ -388,7 +713,7 @@ class LDCMainWindow(QMainWindow):
         self._table_mode = True
         self._reflow_cols = 0
 
-        self.setWindowTitle("Laser Controller Console v0.5.0 — ILX Lightwave LDC-3908")
+        self.setWindowTitle("Laser Controller Console v0.6.0")
         self.resize(1500, 860)
         self.setMinimumSize(900, 620)
         for ext in ("src/laser_controller_icon.ico", "src/laser_controller_icon.png"):
@@ -400,6 +725,8 @@ class LDCMainWindow(QMainWindow):
         self._build_ui()
         self._connect_bridge()
         self._apply_theme()
+        self._update_hw_summary()
+        self._refresh_conn_ui()
         self._set_view_mode(True)
         QTimer.singleShot(0, self._load_last_profile)
         QTimer.singleShot(0, self._update_mode_estimates)
@@ -416,26 +743,21 @@ class LDCMainWindow(QMainWindow):
 
         # --- Top connection bar ---
         top = QHBoxLayout()
-        lbl = QLabel("COM Port:"); lbl.setObjectName("hdr")
-        top.addWidget(lbl)
-        self.com_combo = QComboBox(); self.com_combo.setMinimumWidth(190)
-        self.com_combo.setToolTip("Serial port of the LDC-3908, or 'Demo Simulator' to explore the app offline.")
-        self._refresh_ports()
-        top.addWidget(self.com_combo)
-        self.btn_refresh = QPushButton("↻"); self.btn_refresh.setFixedWidth(34)
-        self.btn_refresh.setToolTip("Rescan the computer for available serial ports.")
-        self.btn_refresh.clicked.connect(self._refresh_ports)
-        top.addWidget(self.btn_refresh)
-        self.btn_connect = QPushButton("Connect"); self.btn_connect.clicked.connect(self.connect_serial)
-        self.btn_connect.setToolTip("Open or close the connection to the selected port.")
+        self.btn_hardware = QPushButton("⚙ Hardware…")
+        self.btn_hardware.setToolTip("Add/remove controllers, choose each one's connection (serial / USB /\n"
+                                     "Demo), and pair split temperature + current instruments into one laser.")
+        self.btn_hardware.clicked.connect(self.open_hardware_dialog)
+        top.addWidget(self.btn_hardware)
+        self.lbl_hw = QLabel(""); self.lbl_hw.setObjectName("hdr")
+        self.lbl_hw.setToolTip("The controllers currently configured.")
+        top.addWidget(self.lbl_hw)
+        top.addSpacing(12)
+        self.btn_connect = QPushButton("Connect All"); self.btn_connect.clicked.connect(self.connect_serial)
+        self.btn_connect.setToolTip("Connect (or disconnect) every configured controller at once.\n"
+                                    "Each controller also has its own Connect button in its header.")
         top.addWidget(self.btn_connect)
-        self.btn_scan = QPushButton("Scan Channels"); self.btn_scan.setEnabled(False)
-        self.btn_scan.setToolTip("Interrogate all 8 slots: find installed laser cards, read their\n"
-                                 "current/temperature limits, and match the controls to the hardware.")
-        self.btn_scan.clicked.connect(self.start_scan)
-        top.addWidget(self.btn_scan)
         self.btn_clear = QPushButton("Clear Faults"); self.btn_clear.setEnabled(False)
-        self.btn_clear.setToolTip("Clear latched chassis fault codes, then rescan the channels.")
+        self.btn_clear.setToolTip("Clear latched fault codes on every connected controller, then rescan.")
         self.btn_clear.clicked.connect(self.clear_faults)
         top.addWidget(self.btn_clear)
         top.addStretch(1)
@@ -468,26 +790,22 @@ class LDCMainWindow(QMainWindow):
         bar.addWidget(self.chk_show_unused)
         root.addLayout(bar)
 
-        # --- Scroll area with the reflowing card container + table header ---
+        # --- Scroll area: a vertical stack of per-unit boxes (each box groups one
+        #     controller's channel cards), with a shared table header on top. ---
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
         self.container = QWidget()
-        self.cards_grid = QGridLayout(self.container)
-        self.cards_grid.setContentsMargins(4, 4, 4, 4)
-        self.cards_grid.setHorizontalSpacing(8)
-        self.cards_grid.setVerticalSpacing(8)
-        self.cards_grid.setAlignment(Qt.AlignTop)
+        self.stack = QVBoxLayout(self.container)
+        self.stack.setContentsMargins(4, 4, 4, 4)
+        self.stack.setSpacing(10)
+        self.stack.setAlignment(Qt.AlignTop)
         self.scroll.setWidget(self.container)
         root.addWidget(self.scroll, 1)
 
         self.table_header = self._build_table_header()
-        self.cards = [ChannelCard(i, self) for i in range(self.num_channels)]
-        # Parent everything to the scroll container up front and start hidden, so
-        # _relayout only ever adds/removes from the layout and toggles visibility —
-        # never setParent(None), which would briefly turn a card into a top-level
-        # window (the "tiny windows flashing" bug).
         self.table_header.setParent(self.container); self.table_header.hide()
-        for c in self.cards:
-            c.setParent(self.container); c.hide()
+        self.cards = []
+        self.unit_boxes = []
+        self._build_channel_widgets()
 
         # --- Bottom panel: [ params + profile stacked ] ... [ presets | EMO | Run ] ---
         bottom = QHBoxLayout(); bottom.setSpacing(16)
@@ -590,8 +908,10 @@ class LDCMainWindow(QMainWindow):
         self.mode_combo.setMinimumWidth(280)
         self.mode_combo.setToolTip(
             "One laser at a time: finish each laser's temp→current before the next.\n"
-            "All temperatures, then all currents: ramps every channel's temperature "
-            "first, then every channel's current (safe for startup and shutdown).\n"
+            "All channels, stage by stage: moves every channel through one stage "
+            "before the next, auto-ordered so the TEC-before-laser interlock holds "
+            "both ways (temperatures come up before currents on start-up; currents "
+            "come down before temperatures on shutdown).\n"
             "All lasers at once: ramp every channel simultaneously (fastest).")
         self.mode_combo.currentIndexChanged.connect(self._mark_unsaved)
         run_col.addWidget(self.mode_combo)
@@ -640,6 +960,277 @@ class LDCMainWindow(QMainWindow):
         self.bridge.post.emit(lambda: fn(*args))
 
     # ------------------------------------------------------------------
+    # System / channel widgets
+    # ------------------------------------------------------------------
+    def _unit_meta(self, unit):
+        def tlabel(dev):
+            spec = getattr(dev, "transport_spec", {}) or {}
+            t = spec.get("type", "sim")
+            if t == "sim":
+                return "Demo"
+            if t == "serial":
+                return spec.get("port", "serial")
+            if t == "visa":
+                return spec.get("resource", "USB")
+            return t
+        parts = [f"{d.model} ({tlabel(d)})" for d in unit.devices]
+        return "  +  ".join(parts)
+
+    def _build_channel_widgets(self):
+        """(Re)create one UnitBox per unit and one ChannelCard per binding, from
+        the current system. Cards are parented to their unit box and start hidden
+        so _relayout only ever adds/removes and toggles visibility."""
+        for box in getattr(self, "unit_boxes", []):
+            box.setParent(None)
+            box.deleteLater()
+        self.unit_boxes = []
+        cards_by_idx = [None] * self.system.num_channels
+        for unit in self.system.units:
+            box = UnitBox(unit, self)
+            box.set_meta(self._unit_meta(unit))
+            for b in unit.channels:
+                card = ChannelCard(b.idx, self, binding=b)
+                card.setParent(box.body)
+                card.hide()
+                cards_by_idx[b.idx] = card
+            box.setParent(self.container)
+            box.hide()
+            self.unit_boxes.append(box)
+        self.cards = cards_by_idx
+        self.populated = [False] * len(self.cards)
+        self._relayout_key = None
+
+    def _snapshot_channel_state(self):
+        """Capture the user-entered per-channel state keyed by (unit_id, ch_num),
+        which is stable across reorder/delete, so a rebuild doesn't wipe it."""
+        snap = {}
+        for b in self.system.channels:
+            c = self.cards[b.idx]
+            snap[(b.unit_id, b.ch_num)] = {
+                "label": c.label.text(), "t": c.t_target.text(), "i": c.i_target.text(),
+                "tec": c.tec_cmd.currentText(), "las": c.las_cmd.currentText(),
+            }
+        return snap
+
+    def _restore_channel_state(self, snap):
+        for b in self.system.channels:
+            s = snap.get((b.unit_id, b.ch_num))
+            if not s:
+                continue
+            c = self.cards[b.idx]
+            c.label.setText(s["label"])
+            c.t_target.setText(s["t"]); c.i_target.setText(s["i"])
+            c.tec_cmd.setCurrentText(s["tec"]); c.las_cmd.setCurrentText(s["las"])
+
+    def _rebuild_system(self, preserve=True):
+        """Rebuild the ControllerSystem from self.config and recreate the channel
+        widgets. Closes any existing connection first. Called after the hardware
+        config changes (Hardware dialog / reorder / profile load). `preserve`
+        carries user-entered targets/labels across the rebuild."""
+        snap = self._snapshot_channel_state() if (preserve and getattr(self, "cards", None)) else {}
+        try:
+            self.system.close_all()
+        except Exception:
+            pass
+        self.telemetry_active = False
+        self.system = sysmod.build_system(self.config)
+        self.seq = Sequencer(stop=self.system.stop, events=QtSequenceEvents(self.bridge))
+        self._build_channel_widgets()
+        for card in self.cards:
+            card.set_table_mode() if self._table_mode else card.set_card_mode()
+        if snap:
+            self._restore_channel_state(snap)
+        self.has_scanned = False
+        self._unit_scanned = {}
+        self.btn_run_all.setEnabled(False)
+        self._lock_controls(False)
+        self._update_hw_summary()
+        self._refresh_conn_ui()
+        self._relayout(force=True)
+
+    def _update_hw_summary(self):
+        units = self.system.units
+        names = ", ".join(u.title for u in units)
+        self.lbl_hw.setText(f"{len(units)} controller{'s' if len(units) != 1 else ''}: {names}")
+
+    def open_hardware_dialog(self):
+        if self.is_executing:
+            QMessageBox.warning(self, "Busy", "Stop the running sequence first.")
+            return
+        if self._any_connected():
+            QMessageBox.information(self, "Disconnect first",
+                                    "Disconnect all controllers before changing the hardware configuration.")
+            return
+        dlg = HardwareDialog(self, self.config)
+        if dlg.exec() == QDialog.Accepted:
+            cfg = dlg.result_config()
+            if not cfg.get("units"):
+                QMessageBox.warning(self, "No controllers", "Add at least one controller.")
+                return
+            self.config = cfg
+            self._rebuild_system()
+            self._mark_unsaved()
+
+    # --- per-controller edit / reorder (from the box header + context menu) ---
+    def _find_unit_cfg(self, uid):
+        for u in self.config.get("units", []):
+            if u.get("id") == uid:
+                return u
+        return None
+
+    def _require_disconnected(self, what):
+        if self.is_executing:
+            QMessageBox.warning(self, "Busy", "Stop the running sequence first.")
+            return False
+        if self._any_connected():
+            QMessageBox.information(self, "Disconnect first", f"Disconnect all controllers before you {what}.")
+            return False
+        return True
+
+    def _rename_unit(self, uid):
+        u = self._find_unit_cfg(uid)
+        if u is None:
+            return
+        cur = u.get("title", "")
+        new, ok = QInputDialog.getText(self, "Rename controller", "Name:", text=cur)
+        if not ok:
+            return
+        new = new.strip() or cur
+        u["title"] = new
+        for un in self.system.units:
+            if un.id == uid:
+                un.title = new
+        for box in self.unit_boxes:
+            if box.unit.id == uid:
+                box.title.setText(new)
+        self._mark_unsaved()
+
+    def _delete_unit(self, uid):
+        if not self._require_disconnected("delete a controller"):
+            return
+        u = self._find_unit_cfg(uid)
+        if u is None:
+            return
+        if QMessageBox.question(self, "Delete controller",
+                                f"Remove “{u.get('title')}” from the configuration?") != QMessageBox.Yes:
+            return
+        self.config["units"] = [x for x in self.config["units"] if x.get("id") != uid]
+        self._rebuild_system()
+        self._mark_unsaved()
+
+    def _move_unit(self, uid, delta):
+        if not self._require_disconnected("reorder controllers"):
+            return
+        units = self.config["units"]
+        i = next((k for k, u in enumerate(units) if u.get("id") == uid), None)
+        if i is None:
+            return
+        j = i + delta
+        if 0 <= j < len(units):
+            units[i], units[j] = units[j], units[i]
+            self._rebuild_system()
+            self._mark_unsaved()
+
+    def _reorder_units(self, src_uid, target_uid, before):
+        if src_uid == target_uid or not self._require_disconnected("reorder controllers"):
+            return
+        units = self.config["units"]
+        src = next((u for u in units if u.get("id") == src_uid), None)
+        if src is None:
+            return
+        units.remove(src)
+        tpos = next((k for k, u in enumerate(units) if u.get("id") == target_uid), len(units))
+        if not before:
+            tpos += 1
+        units.insert(tpos, src)
+        self._rebuild_system()
+        self._mark_unsaved()
+
+    def _edit_unit(self, uid):
+        if not self._require_disconnected("edit a controller"):
+            return
+        u = self._find_unit_cfg(uid)
+        if u is None:
+            return
+        ports = self._available_ports()
+        if u.get("kind") == "pairing":
+            title, ok = QInputDialog.getText(self, "Edit pairing", "Name:", text=u.get("title", ""))
+            if not ok:
+                return
+            tspec = pick_transport(self, ports, "Temperature (Wavelength TC) connection",
+                                   u["temp"].get("transport"))
+            if tspec is None:
+                return
+            cspec = pick_transport(self, ports, "Current (Wavelength QCL) connection",
+                                   u["current"].get("transport"))
+            if cspec is None:
+                return
+            u["title"] = title.strip() or u.get("title")
+            u["temp"]["transport"] = tspec
+            u["current"]["transport"] = cspec
+        else:
+            d = QDialog(self); d.setWindowTitle("Edit controller")
+            f = QFormLayout(d)
+            dtype = QComboBox()
+            for key, label in _COMBINED_TYPES:
+                dtype.addItem(label, key)
+            dtype.setCurrentIndex(next((k for k, (key, _) in enumerate(_COMBINED_TYPES)
+                                        if key == u.get("driver")), 0))
+            f.addRow("Controller:", dtype)
+            name = QLineEdit(u.get("title", "")); f.addRow("Name:", name)
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(d.accept); bb.rejected.connect(d.reject)
+            f.addRow(bb)
+            if d.exec() != QDialog.Accepted:
+                return
+            spec = pick_transport(self, ports, f"Connection for {dtype.currentText()}",
+                                  u.get("transport"))
+            if spec is None:
+                return
+            u["driver"] = dtype.currentData()
+            u["title"] = name.text().strip() or dtype.currentText()
+            u["transport"] = spec
+        self._rebuild_system()
+        self._mark_unsaved()
+
+    def _drop_channel(self, src_idx, unit_id, global_pos):
+        """Reorder a channel within its controller (drag-and-drop). Only combined
+        multi-channel controllers reorder; channels can't move between controllers."""
+        if not (0 <= src_idx < len(self.system.channels)):
+            return
+        src_b = self.system.channels[src_idx]
+        if src_b.unit_id != unit_id:
+            return
+        ucfg = self._find_unit_cfg(unit_id)
+        unit = next((u for u in self.system.units if u.id == unit_id), None)
+        if ucfg is None or unit is None or ucfg.get("kind") != "combined" or len(unit.channels) < 2:
+            return
+        if not self._require_disconnected("reorder channels"):
+            return
+        order = [b.ch_num for b in unit.channels]
+        target_ch, before = None, True
+        for b in unit.channels:
+            card = self.cards[b.idx]
+            if not card.isVisible():
+                continue
+            top = card.mapToGlobal(QPoint(0, 0)).y()
+            bottom = top + card.height()
+            if top <= global_pos.y() <= bottom:
+                target_ch = b.ch_num
+                before = global_pos.y() < (top + bottom) / 2
+                break
+        if target_ch is None or target_ch == src_b.ch_num:
+            return
+        order.remove(src_b.ch_num)
+        tpos = order.index(target_ch)
+        if not before:
+            tpos += 1
+        order.insert(tpos, src_b.ch_num)
+        ucfg["channel_order"] = order
+        self._rebuild_system()
+        self._mark_unsaved()
+
+    # ------------------------------------------------------------------
     # View mode + reflow + visibility
     # ------------------------------------------------------------------
     def _set_view_mode(self, table):
@@ -653,48 +1244,66 @@ class LDCMainWindow(QMainWindow):
         self._relayout()
 
     def _shown(self):
-        if self.chk_show_unused.isChecked() or not self.has_scanned:
+        if self.chk_show_unused.isChecked():
             return list(range(self.num_channels))
-        return [i for i in range(self.num_channels)
-                if self.populated[i] and self.cards[i].enable.isChecked()]
+        out = []
+        for b in self.system.channels:
+            if not self._unit_scanned.get(b.unit_id, False):
+                out.append(b.idx)          # not yet scanned: show so the layout is visible
+            elif self.populated[b.idx] and self.cards[b.idx].enable.isChecked():
+                out.append(b.idx)
+        return out
 
     def _relayout(self, force=False):
         if not getattr(self, "cards", None):
             return
         shown = self._shown()
+        shown_set = set(shown)
         if self._table_mode:
             cols = 1
         else:
             vw = self.scroll.viewport().width()
             cols = max(1, min(vw // CARD_W, max(1, len(shown))))
-        key = (self._table_mode, cols, tuple(shown))
+        key = (self._table_mode, cols, tuple(shown), len(self.unit_boxes))
         if not force and key == getattr(self, "_relayout_key", None):
             return
         self._relayout_key = key
 
-        # Remove all items from the layout (widgets stay children of the container,
-        # so nothing becomes a top-level window / flashes).
-        while self.cards_grid.count():
-            self.cards_grid.takeAt(0)
-        for c in range(max(4, self.cards_grid.columnCount())):
-            self.cards_grid.setColumnStretch(c, 0)
+        # Detach the stack items and each box's grid items (widgets stay parented
+        # to the container / their box, so nothing becomes a top-level window).
+        while self.stack.count():
+            self.stack.takeAt(0)
+        for box in self.unit_boxes:
+            while box.grid.count():
+                box.grid.takeAt(0)
+            for c in range(max(4, box.grid.columnCount())):
+                box.grid.setColumnStretch(c, 0)
 
-        shown_set = set(shown)
+        # Shared column header on top (table view only).
         if self._table_mode:
-            self.cards_grid.setColumnStretch(0, 1)
-            self.cards_grid.addWidget(self.table_header, 0, 0)
+            self.stack.addWidget(self.table_header)
             self.table_header.setVisible(True)
-            for pos, i in enumerate(shown):
-                self.cards_grid.addWidget(self.cards[i], pos + 1, 0)
         else:
             self.table_header.setVisible(False)
-            for c in range(cols):
-                self.cards_grid.setColumnStretch(c, 1)
-            for pos, i in enumerate(shown):
-                r, c = divmod(pos, cols)
-                self.cards_grid.addWidget(self.cards[i], r, c)
-        for i in range(self.num_channels):
-            self.cards[i].setVisible(i in shown_set)
+
+        for box in self.unit_boxes:
+            vis = [self.cards[b.idx] for b in box.unit.channels if b.idx in shown_set]
+            if self._table_mode:
+                box.grid.setColumnStretch(0, 1)
+                for pos, card in enumerate(vis):
+                    box.grid.addWidget(card, pos, 0)
+            else:
+                for c in range(cols):
+                    box.grid.setColumnStretch(c, 1)
+                for pos, card in enumerate(vis):
+                    r, c = divmod(pos, cols)
+                    box.grid.addWidget(card, r, c)
+            box.setVisible(bool(vis))
+            if vis:
+                self.stack.addWidget(box)
+
+        for i, card in enumerate(self.cards):
+            card.setVisible(i in shown_set)
 
     def _apply_visibility(self, *_):
         self._relayout(force=True)
@@ -744,121 +1353,201 @@ class LDCMainWindow(QMainWindow):
         QTimer.singleShot(300, QApplication.beep)
 
     # ------------------------------------------------------------------
-    # Connection / ports
+    # Connection
     # ------------------------------------------------------------------
-    def _refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        ports.append("Demo Simulator")
-        self.com_combo.clear(); self.com_combo.addItems(ports)
-        real = [p for p in ports if p != "Demo Simulator"]
-        self.com_combo.setCurrentText(real[0] if real else "Demo Simulator")
+    @staticmethod
+    def _available_ports():
+        return [p.device for p in serial.tools.list_ports.comports()]
 
     def _set_status(self, text):
         self.status_label.setText(text)
 
+    # --- per-controller state ---
+    def _unit(self, uid):
+        return next((u for u in self.system.units if u.id == uid), None)
+
+    def _box(self, uid):
+        return next((b for b in self.unit_boxes if b.unit.id == uid), None)
+
+    def _unit_connected(self, unit):
+        return bool(unit.devices) and all(d.is_connected for d in unit.devices)
+
+    def _unit_needs_scan(self, unit):
+        """Only multi-channel combined controllers (e.g. ILX) discover which
+        channels have lasers; single-channel instruments are always active."""
+        return (unit.kind == sysmod.KIND_COMBINED and unit.devices
+                and unit.devices[0].num_channels > 1)
+
+    def _any_connected(self):
+        return any(self._unit_connected(u) for u in self.system.units)
+
+    # --- global connect / disconnect (top-bar button) ---
     def connect_serial(self):
         if self.is_executing:
             self._set_status("Status: PRESS STOP BEFORE DISCONNECTING!")
             return
-        if self.btn_connect.text() == "Disconnect":
-            self.disconnect_serial()
-            return
-        choice = self.com_combo.currentText()
-        if choice == "Demo Simulator":
-            self.driver.open_simulator()
-            self._set_status("Status: Demo Mode Active")
+        if all(self._unit_connected(u) for u in self.system.units) and self.system.units:
+            for u in list(self.system.units):
+                self._disconnect_unit(u.id, relayout=False)
         else:
-            try:
-                self.driver.open(choice, timeout=5.0)
-            except Exception as e:
-                QMessageBox.critical(self, "Connection Error", f"Failed to connect to {choice}:\n{e}")
-                self._set_status("Status: Connection Failed")
-                return
-            self._set_status("Status: Connected (Ready)")
-        self.btn_connect.setText("Disconnect")
-        self.com_combo.setEnabled(False)
-        self.btn_scan.setEnabled(True)
-        self.btn_clear.setEnabled(True)
-
-    def disconnect_serial(self):
-        self.telemetry_active = False
-        if self.telemetry_thread and self.telemetry_thread.is_alive():
-            self.telemetry_thread.join(timeout=1.0)
-        self.driver.close()
-        self._set_status("Status: Disconnected")
-        self.btn_connect.setText("Connect")
-        self.com_combo.setEnabled(True)
-        self.btn_scan.setEnabled(False)
-        self.btn_clear.setEnabled(False)
-        self.btn_run_all.setEnabled(False)
-        self._lock_controls(False)
-        self.has_scanned = False
-        for i in range(self.num_channels):
-            self._mark_empty(i, "Disconnected")
+            for u in list(self.system.units):
+                if not self._unit_connected(u):
+                    self._connect_unit(u.id)
         self._relayout(force=True)
+        self._refresh_conn_ui()
 
-    # ------------------------------------------------------------------
-    # Scan
-    # ------------------------------------------------------------------
-    def start_scan(self):
-        self.is_scanning = True
-        self.btn_scan.setEnabled(False)
-        self._set_status("Status: Scanning active hardware...")
-        threading.Thread(target=self._run_scan, daemon=True).start()
+    # --- per-controller connect / disconnect (header button) ---
+    def _toggle_unit_connect(self, uid):
+        if self.is_executing:
+            self._set_status("Status: PRESS STOP BEFORE DISCONNECTING!")
+            return
+        unit = self._unit(uid)
+        if unit is None:
+            return
+        if self._unit_connected(unit):
+            self._disconnect_unit(uid)
+        else:
+            self._connect_unit(uid)
+            self._relayout(force=True)
+        self._refresh_conn_ui()
 
-    def _run_scan(self):
-        cards = 0
-        for k in range(self.num_channels):
-            if self.is_closing or not self.driver.is_connected:
-                break
-            ch_num = k + 1
-            with self.driver.serial_lock:
+    def _connect_unit(self, uid):
+        unit = self._unit(uid)
+        if unit is None or self._unit_connected(unit):
+            return
+        opened = []
+        try:
+            for d in unit.devices:
+                sysmod._connect_driver(d, getattr(d, "transport_spec", {"type": "sim"}))
+                opened.append(d)
+        except Exception as e:
+            for d in opened:
                 try:
-                    self.driver.select_channel(ch_num)
+                    d.close()
+                except Exception:
+                    pass
+            QMessageBox.critical(self, "Connection Error", f"Failed to connect “{unit.title}”:\n{e}")
+            return
+        self._set_status(f"Status: {unit.title} connected — scanning…")
+        # Auto-scan on connect: ILX interrogates its slots; others just mark active.
+        self.is_scanning = True
+        threading.Thread(target=self._scan_unit, args=(uid,), daemon=True).start()
+
+    def _disconnect_unit(self, uid, relayout=True):
+        unit = self._unit(uid)
+        if unit is None:
+            return
+        for d in unit.devices:
+            try:
+                d.close()
+            except Exception:
+                pass
+        self._unit_scanned[uid] = False
+        for b in unit.channels:
+            self._mark_empty(b.idx, "Disconnected")
+        if not self._any_connected():
+            self.telemetry_active = False
+        self._set_status(f"Status: {unit.title} disconnected")
+        if relayout:
+            self._relayout(force=True)
+        self._refresh_conn_ui()
+
+    def _rescan_unit(self, uid):
+        unit = self._unit(uid)
+        if unit is None or not self._unit_connected(unit) or self.is_executing:
+            return
+        self.is_scanning = True
+        self._set_status(f"Status: Rescanning {unit.title}…")
+        threading.Thread(target=self._scan_unit, args=(uid,), daemon=True).start()
+
+    def _refresh_conn_ui(self):
+        units = self.system.units
+        all_conn = bool(units) and all(self._unit_connected(u) for u in units)
+        any_conn = self._any_connected()
+        self.btn_connect.setText("Disconnect All" if all_conn else "Connect All")
+        self.btn_clear.setEnabled(any_conn)
+        self.btn_run_all.setEnabled(any_conn and any(self._unit_scanned.get(u.id) for u in units))
+        # Hardware layout may only change while fully disconnected.
+        self.btn_hardware.setEnabled(not any_conn)
+        for box in self.unit_boxes:
+            u = self._unit(box.unit.id)
+            box.enable_scan(self._unit_needs_scan(u))
+            box.set_connected(self._unit_connected(u))
+
+    @staticmethod
+    def _dev_read(drv, ch, fn, default):
+        """Read one value from a device under its lock, selecting its channel if
+        needed. Returns `default` on any error / missing device."""
+        if drv is None:
+            return default
+        try:
+            with drv.serial_lock:
+                if drv._selected_channel != ch:
+                    drv.select_channel(ch)
+                    drv._selected_channel = ch
                     time.sleep(0.1)
-                    try:
-                        ans_i = self.driver.active_channel()
-                    except Exception:
-                        ans_i = -1
-                    if ans_i != ch_num:
-                        self._post(self._mark_empty, k, "Empty Slot")
-                        continue
-                    cards += 1
-                    try:
-                        t_val = self.driver.temp_setpoint()
-                    except Exception:
-                        t_val = float('nan')
-                    try:
-                        i_val = self.driver.current_setpoint()
-                    except Exception:
-                        i_val = 0.0
-                    try:
-                        tec_out = self.driver.tec_output()
-                        las_out = self.driver.laser_output()
-                    except Exception:
-                        tec_out = las_out = 0
-                    # A negative/NaN setpoint means the slot has a module but no
-                    # laser attached (see note in the driver simulator). A real
-                    # laser's setpoint is never below 0 degC in our use case.
-                    if math.isnan(t_val) or t_val < 0:
-                        self._post(self._mark_empty, k, "No Laser Attached")
-                        continue
-                    has_err, err = self.driver.read_errors()
-                    try:
-                        max_t = self.driver.temp_limit()
-                    except Exception:
-                        max_t = 99.0
-                    try:
-                        max_i = self.driver.current_limit()
-                    except Exception:
-                        max_i = 500.0
-                    self.driver.enable_modulation()
-                    self._post(self._update_after_scan, k, t_val, i_val, tec_out, las_out,
-                               max_t, max_i, has_err, err)
-                except Exception as e:
-                    print(f"Scan error ch{ch_num}: {e}")
-                    self._post(self._mark_empty, k, "Empty Slot")
-        self._post(self._finish_scan, cards)
+                return fn()
+        except Exception:
+            return default
+
+    def _scan_unit(self, uid):
+        unit = self._unit(uid)
+        if unit is None:
+            self._post(self._finish_unit_scan, uid, 0)
+            return
+        cards = 0
+        for b in unit.channels:
+            if self.is_closing or not self._unit_connected(unit):
+                break
+            if self._scan_binding(b):
+                cards += 1
+        self._post(self._finish_unit_scan, uid, cards)
+
+    def _scan_binding(self, b):
+        k = b.idx
+        td, cd = b.temp_driver, b.current_driver
+        tch = b.temp.channel if b.temp else 1
+        cch = b.current.channel if b.current else 1
+        rd = self._dev_read
+        # Multi-channel combined controllers (e.g. ILX) have empty slots / no-laser
+        # modules; single-channel instruments are simply present when connected.
+        multi_combined = td is not None and td is cd and td.num_channels > 1
+
+        if multi_combined:
+            if rd(td, tch, td.active_channel, -1) != tch:
+                self._post(self._mark_empty, k, "Empty Slot")
+                return False
+
+        t_val = rd(td, tch, td.temp_setpoint, float('nan'))
+        i_val = rd(cd, cch, cd.current_setpoint, 0.0)
+        tec_out = rd(td, tch, td.tec_output, 0)
+        las_out = rd(cd, cch, cd.laser_output, 0)
+
+        if multi_combined:
+            # A negative/NaN setpoint means a module with no laser attached. A real
+            # laser's setpoint is never below 0 °C in our use case.
+            if (isinstance(t_val, float) and math.isnan(t_val)) or t_val < 0:
+                self._post(self._mark_empty, k, "No Laser Attached")
+                return False
+
+        max_t = rd(td, tch, td.temp_limit, 99.0)
+        max_i = rd(cd, cch, cd.current_limit, 500.0)
+
+        has_err, err = False, ""
+        for drv, ch in ((td, tch), (cd, cch)):
+            if drv is None:
+                continue
+            he, e = rd(drv, ch, drv.read_errors, (False, ""))
+            if he:
+                has_err, err = True, e
+                break
+        rd(cd, cch, cd.enable_modulation, None)  # normalize modulation state
+
+        if isinstance(t_val, float) and math.isnan(t_val):
+            t_val = 0.0
+        self._post(self._update_after_scan, k, t_val, i_val, tec_out, las_out,
+                   max_t, max_i, has_err, err)
+        return True
 
     def _update_after_scan(self, i, t_val, i_val, tec_out, las_out, max_t, max_i, has_err, err):
         self.populated[i] = True
@@ -895,19 +1584,23 @@ class LDCMainWindow(QMainWindow):
         c.live_t.setText("0.0"); c.live_i.setText("0.0")
         self._on_status(i, reason, "muted"); self._on_led(i, "empty")
 
-    def _finish_scan(self, cards):
+    def _finish_unit_scan(self, uid, cards):
         self.is_scanning = False
         if self.is_closing:
             self.close(); return
-        self._set_status("Status: Scan Complete & Matched" if cards else
-                         "WARNING: 0 slots responded. Check connection & power.")
+        self._unit_scanned[uid] = True
         self.has_scanned = True
+        unit = self._unit(uid)
+        title = unit.title if unit else ""
+        demo = unit and all((getattr(d, "transport_spec", {}) or {}).get("type", "sim") == "sim"
+                            for d in unit.devices)
+        self._set_status(f"Status: {title} ready — {cards} channel{'s' if cards != 1 else ''}"
+                         + (" (Demo)" if demo else ""))
         self._relayout(force=True)
         self._lock_controls(True)
-        self.btn_scan.setEnabled(True)
-        self.btn_run_all.setEnabled(True)
+        self._refresh_conn_ui()
         self._update_mode_estimates()
-        if not self.telemetry_active:
+        if not self.telemetry_active and self._any_connected():
             self.telemetry_active = True
             self.telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
             self.telemetry_thread.start()
@@ -922,43 +1615,37 @@ class LDCMainWindow(QMainWindow):
             time.sleep(2.0)
 
     def _telemetry_cycle(self):
-        with self.driver.serial_lock:
-            if not self.driver.is_connected:
-                return
-            any_on = False
-            for k in range(self.num_channels):
-                if self.is_executing or self.is_scanning or self.is_closing:
+        if not self._any_connected():
+            return
+        any_on = False
+        rd = self._dev_read
+        for b in self.system.channels:
+            if self.is_executing or self.is_scanning or self.is_closing:
+                break
+            k = b.idx
+            # Only populated channels (of connected, scanned units) are polled.
+            if not self.populated[k]:
+                continue
+            td, cd = b.temp_driver, b.current_driver
+            tch = b.temp.channel if b.temp else 1
+            cch = b.current.channel if b.current else 1
+            try:
+                t_val = rd(td, tch, td.temp_setpoint, None) if td else None
+                i_val = rd(cd, cch, cd.current_setpoint, None) if cd else None
+                tec = rd(td, tch, td.tec_output, None) if td else None
+                las = rd(cd, cch, cd.laser_output, None) if cd else None
+                self._post(self._telemetry_update, k, t_val, i_val, tec, las)
+                if las == 1:
+                    any_on = True
+                self.telemetry_fail_count = 0
+            except Exception as e:
+                print(f"Telemetry fail ch{k + 1}: {e}")
+                self.telemetry_fail_count += 1
+                if self.telemetry_fail_count > 3:
+                    self.telemetry_active = False
+                    self._post(self._handle_connection_loss)
                     break
-                if not self.populated[k]:
-                    continue
-                ch_num = k + 1
-                try:
-                    self.driver.select_channel(ch_num)
-                    try:
-                        t_val = self.driver.temp_setpoint()
-                    except Exception:
-                        t_val = None
-                    try:
-                        i_val = self.driver.current_setpoint()
-                    except Exception:
-                        i_val = None
-                    try:
-                        tec = self.driver.tec_output()
-                        las = self.driver.laser_output()
-                    except Exception:
-                        tec = las = None
-                    self._post(self._telemetry_update, k, t_val, i_val, tec, las)
-                    if las == 1:
-                        any_on = True
-                    self.telemetry_fail_count = 0
-                except Exception as e:
-                    print(f"Telemetry fail ch{ch_num}: {e}")
-                    self.telemetry_fail_count += 1
-                    if self.telemetry_fail_count > 3:
-                        self.telemetry_active = False
-                        self._post(self._handle_connection_loss)
-                        break
-            self._post(self.btn_emo.setEnabled, any_on)
+        self._post(self.btn_emo.setEnabled, any_on)
 
     def _telemetry_update(self, i, t_val, i_val, tec, las):
         try:
@@ -981,8 +1668,8 @@ class LDCMainWindow(QMainWindow):
         self._set_status("Status: Connection Lost")
         self._lock_controls(False)
         self.btn_connect.setText("Connect")
-        self.driver.ser = None
-        self.driver.is_stop_requested = True
+        self.btn_hardware.setEnabled(True)
+        self.system.stop.is_stop_requested = True
         QMessageBox.critical(self, "Connection Lost",
                              "Hardware communication lost. Execution halted. Lasers not explicitly shut off.")
 
@@ -1006,14 +1693,14 @@ class LDCMainWindow(QMainWindow):
     # Sequence execution
     # ------------------------------------------------------------------
     def execute_all(self):
-        chans = [i + 1 for i in range(self.num_channels)
-                 if self.cards[i].enable.isChecked() and self.cards[i].enable.isEnabled()]
-        if not chans:
+        idxs = [i for i in range(self.num_channels)
+                if self.cards[i].enable.isChecked() and self.cards[i].enable.isEnabled()]
+        if not idxs:
             QMessageBox.warning(self, "Warning", 'No channels are marked "On" for the sequence!')
             return
-        self.execute_channels(chans)
+        self.execute_channels(idxs)
 
-    def execute_channels(self, chans):
+    def execute_channels(self, idxs):
         if self.is_executing:
             return
         try:
@@ -1026,22 +1713,22 @@ class LDCMainWindow(QMainWindow):
             return
 
         plans = []
-        for ch_num in chans:
-            c = self.cards[ch_num - 1]
+        for i in idxs:
+            c = self.cards[i]
+            b = self.system.channels[i]
             try:
                 tt = float(c.t_target.text()); ti = float(c.i_target.text()); valid = True
             except ValueError:
                 tt, ti, valid = 0.0, 0.0, False
-            plans.append(ChannelPlan(idx=ch_num - 1, ch_num=ch_num,
+            plans.append(ChannelPlan(idx=i, ch_num=b.ch_num,
                                      tec_cmd=c.tec_cmd.currentText(), las_cmd=c.las_cmd.currentText(),
-                                     t_target=tt, i_target=ti, targets_valid=valid))
+                                     t_target=tt, i_target=ti, targets_valid=valid, binding=b))
 
         mode = self._selected_mode()
-        infos = self._infos_from_cards([p.ch_num for p in plans if p.targets_valid])
+        infos = self._infos_from_cards([p.idx for p in plans if p.targets_valid])
         self.total_estimated_time = estimate_run_times(infos, t_ramp, i_ramp, t_off).get(mode, 0.0)
         self.is_executing = True
-        self.driver.is_stop_requested = False
-        self.driver.is_emo_requested = False
+        self.system.stop.reset()
         self._set_status("Status: Sequence Running...")
         self._lock_controls(False)
         self.btn_stop.setEnabled(True)
@@ -1053,13 +1740,13 @@ class LDCMainWindow(QMainWindow):
         return self._MODE_KEYS[self.mode_combo.currentIndex()]
 
     def _active_channels(self):
-        return [i + 1 for i in range(self.num_channels)
+        return [i for i in range(self.num_channels)
                 if self.populated[i] and self.cards[i].enable.isChecked()]
 
-    def _infos_from_cards(self, ch_nums):
+    def _infos_from_cards(self, idxs):
         infos = []
-        for ch_num in ch_nums:
-            c = self.cards[ch_num - 1]
+        for i in idxs:
+            c = self.cards[i]
             try:
                 tt = float(c.t_target.text()); ti = float(c.i_target.text())
                 ct = float(c.live_t.text()); ci = float(c.live_i.text())
@@ -1098,15 +1785,16 @@ class LDCMainWindow(QMainWindow):
         self.is_executing = False
         self._lock_controls(True)
         self.btn_stop.setEnabled(False)
-        if self.driver.is_emo_requested:
+        if self.system.stop.is_emo_requested:
             self._perform_emergency_shutdown()
-            self.driver.is_emo_requested = False
-        elif self.driver.is_stop_requested:
+            self.system.stop.is_emo_requested = False
+        elif self.system.stop.is_stop_requested:
             self._set_status("Status: Hardware Halted & Pinned.")
         else:
             self._set_status("Status: Sequence Complete & Settled.")
             if n > 1:
                 QMessageBox.information(self, "Done", "Sequence completed across all selected channels.")
+        self._refresh_conn_ui()
         threading.Thread(target=self._telemetry_cycle, daemon=True).start()
 
     def update_eta(self):
@@ -1123,7 +1811,7 @@ class LDCMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def stop_execution(self):
         if self.is_executing:
-            self.driver.is_stop_requested = True
+            self.system.stop.is_stop_requested = True
             self._set_status("Status: STOP COMMANDED. Halting safely...")
             self._triple_bell()
 
@@ -1132,8 +1820,8 @@ class LDCMainWindow(QMainWindow):
                                 "Immediately cutting current without ramping can damage the diode. Proceed?") \
                 != QMessageBox.Yes:
             return
-        self.driver.is_stop_requested = True
-        self.driver.is_emo_requested = True
+        self.system.stop.is_stop_requested = True
+        self.system.stop.is_emo_requested = True
         if self.is_executing:
             self._set_status("Status: EMERGENCY OFF — cutting laser...")
             return
@@ -1141,35 +1829,43 @@ class LDCMainWindow(QMainWindow):
         self._emo_thread.start()
 
     def _perform_emergency_shutdown(self):
-        with self.driver.serial_lock:
-            for k in range(self.num_channels):
-                if not self.populated[k]:
-                    continue
-                try:
-                    self.driver.select_channel(k + 1)
+        # Cut laser current on every populated channel, on whatever device owns
+        # its current output (the QCL for a Wavelength pairing).
+        for b in self.system.channels:
+            if not self.populated[b.idx] or b.current is None:
+                continue
+            cd, cch = b.current.driver, b.current.channel
+            try:
+                with cd.serial_lock:
+                    cd.select_channel(cch); cd._selected_channel = cch
                     time.sleep(0.15)
-                    self.driver.set_laser(False)
-                    self._post(self._on_status, k, "EMERGENCY OFF: Current Cut", "fault")
-                    self._post(self._on_led, k, "fault")
-                except Exception:
-                    pass
+                    cd.set_laser(False)
+                self._post(self._on_status, b.idx, "EMERGENCY OFF: Current Cut", "fault")
+                self._post(self._on_led, b.idx, "fault")
+            except Exception:
+                pass
         self._post(self._set_status, "Status: EMERGENCY LASER SHUTDOWN TRIGGERED.")
 
     def clear_faults(self):
-        self._set_status("Status: Clearing chassis faults...")
+        self._set_status("Status: Clearing faults...")
 
         def run():
-            with self.driver.serial_lock:
-                for k in range(self.num_channels):
-                    if not self.populated[k]:
-                        continue
-                    try:
-                        self.driver.select_channel(k + 1); time.sleep(0.1)
-                        self.driver.clear_module(); time.sleep(0.1)
-                    except Exception:
-                        pass
+            for d in self.system.devices:
+                if not d.is_connected:
+                    continue
+                try:
+                    with d.serial_lock:
+                        for ch in range(1, d.num_channels + 1):
+                            d.select_channel(ch); d._selected_channel = ch
+                            time.sleep(0.1)
+                            d.clear_module(); time.sleep(0.1)
+                except Exception:
+                    pass
+            # Rescan every connected controller.
             self.is_scanning = True
-            self._run_scan()
+            for u in self.system.units:
+                if self._unit_connected(u):
+                    self._scan_unit(u.id)
         threading.Thread(target=run, daemon=True).start()
 
     # ------------------------------------------------------------------
@@ -1185,7 +1881,6 @@ class LDCMainWindow(QMainWindow):
         for b in self._master_buttons:
             b.setEnabled(enabled)
         self.btn_run_all.setEnabled(enabled)
-        self.btn_scan.setEnabled(enabled)
         self.mode_combo.setEnabled(enabled)
         for w in (self.t_ramp, self.i_ramp, self.t_off, self.btn_save, self.btn_load, self.btn_clear_prof):
             w.setEnabled(enabled)
@@ -1222,7 +1917,7 @@ class LDCMainWindow(QMainWindow):
         pal.setColor(QPalette.Text, QColor(text))
         pal.setColor(QPalette.Highlight, QColor("#1976D2"))
         pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
-        combos = [self.com_combo]
+        combos = []
         if hasattr(self, "mode_combo"):
             combos.append(self.mode_combo)
         for c in getattr(self, "cards", []):
@@ -1252,11 +1947,12 @@ class LDCMainWindow(QMainWindow):
         if not path:
             return
         try:
-            data = {"COM_Port": self.com_combo.currentText(),
-                    "T_ramp": float(self.t_ramp.text()), "I_ramp": float(self.i_ramp.text()),
+            data = {"T_ramp": float(self.t_ramp.text()), "I_ramp": float(self.i_ramp.text()),
                     "T_OFF_Target": float(self.t_off.text()),
                     "Ramp_Mode": self._selected_mode(),
-                    "View_Mode": "table" if self._table_mode else "cards", "channels": []}
+                    "View_Mode": "table" if self._table_mode else "cards",
+                    "hardware": self.config,   # full controller layout (units + transports + pairings)
+                    "channels": []}
             for c in self.cards:
                 data["channels"].append({"T_Target": float(c.t_target.text() or 0),
                                          "I_Target": float(c.i_target.text() or 0),
@@ -1276,9 +1972,24 @@ class LDCMainWindow(QMainWindow):
             self._load_profile_file(path, announce=True)
 
     def _load_profile_file(self, path, announce=False):
+        if self.is_executing:
+            QMessageBox.warning(self, "Busy", "Stop the running sequence before loading a profile.")
+            return
         try:
             with open(path) as f:
                 data = json.load(f)
+            # Restore the hardware layout first, then re-apply per-channel state.
+            hw = data.get("hardware")
+            if hw and hw.get("units"):
+                self.config = hw
+            else:
+                # Legacy flat profile: one ILX LDC-3908 on its saved COM port.
+                port = data.get("COM_Port", "")
+                spec = ({"type": "serial", "port": port}
+                        if port and port != "Demo Simulator" else {"type": "sim"})
+                self.config = sysmod.single_ldc3908_config(spec)
+            self._rebuild_system()
+
             self.t_ramp.setText(str(data["T_ramp"]))
             self.i_ramp.setText(str(data["I_ramp"]))
             self.t_off.setText(str(data["T_OFF_Target"]))
@@ -1291,10 +2002,11 @@ class LDCMainWindow(QMainWindow):
             self.btn_view_table.setChecked(table)
             self.btn_view_cards.setChecked(not table)
             self._set_view_mode(table)
-            for k, cfg in enumerate(data["channels"][:self.num_channels]):
-                self.cards[k].t_target.setText(str(cfg["T_Target"]))
-                self.cards[k].i_target.setText(str(cfg["I_Target"]))
-                self.cards[k].label.setText(cfg.get("Label", f"Laser {k + 1}"))
+            for k, cfg in enumerate(data.get("channels", [])[:self.num_channels]):
+                self.cards[k].t_target.setText(str(cfg.get("T_Target", 22.0)))
+                self.cards[k].i_target.setText(str(cfg.get("I_Target", 0.0)))
+                if cfg.get("Label"):
+                    self.cards[k].label.setText(cfg["Label"])
             self.active_profile_path = path
             self._save_pref(path)
             self._set_profile_label(f"Active Profile: {os.path.basename(path)}")
@@ -1308,6 +2020,8 @@ class LDCMainWindow(QMainWindow):
         if QMessageBox.question(self, "Confirm Clear",
                                 "Clear the active profile and reset all settings to defaults?") != QMessageBox.Yes:
             return
+        self.config = sysmod.default_config()
+        self._rebuild_system()
         self.t_ramp.setText("0.1"); self.i_ramp.setText("0.5"); self.t_off.setText("22.0")
         self.mode_combo.blockSignals(True)
         self.mode_combo.setCurrentIndex(0)  # back to "One laser at a time"
@@ -1315,8 +2029,6 @@ class LDCMainWindow(QMainWindow):
         self.btn_view_table.setChecked(True)
         self.btn_view_cards.setChecked(False)
         self._set_view_mode(True)
-        for k, c in enumerate(self.cards):
-            c.t_target.setText("22.0"); c.i_target.setText("0.0"); c.label.setText(f"Laser {k + 1}")
         try:
             if os.path.exists(PREF_FILE):
                 os.remove(PREF_FILE)
@@ -1366,7 +2078,7 @@ class LDCMainWindow(QMainWindow):
             self.telemetry_thread.join(timeout=1.0)
         if self._emo_thread and self._emo_thread.is_alive():
             self._emo_thread.join(timeout=3.0)
-        self.driver.close()
+        self.system.close_all()
         event.accept()
 
 
