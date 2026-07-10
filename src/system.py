@@ -231,10 +231,9 @@ def build_system(config, stop=None):
 # Convenience configs
 # ----------------------------------------------------------------------------
 def default_config():
-    """A single ILX LDC-3908 unit — the app's default (matches legacy behavior)."""
-    return {"units": [{"id": "u1", "kind": KIND_COMBINED, "driver": "ldc3908",
-                       "title": "ILX Lightwave LDC-3908",
-                       "transport": {"type": "sim"}}]}
+    """No controllers — the app starts empty; the user adds controllers via the
+    Hardware dialog or by loading a profile."""
+    return {"units": []}
 
 
 def single_ldc3908_config(transport_spec, channel_labels=None):

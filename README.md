@@ -89,7 +89,7 @@ The ILX Lightwave LDC-3908 communicates over a standard RS-232 serial interface.
 ### Connecting to the Host
 1. Connect each controller to the host PC — RS-232 (null-modem cable or USB-to-RS232 adapter) for the ILX, USB directly for the Thorlabs/Wavelength instruments.
 2. Run the application by executing `python src/main.py` from the project root.
-3. Click **⚙ Hardware…** to configure your controllers: add each controller (or a Wavelength temperature+current pairing) — you can add as many of any type as you like — and choose each one's connection (a serial port, a USB/VISA resource, or **Demo Simulator** to explore the app offline). The default configuration is a single ILX LDC-3908 in Demo mode.
+3. Click **⚙ Hardware…** to configure your controllers: add each controller (or a Wavelength temperature+current pairing) — you can add as many of any type as you like — and choose each one's connection (a serial port, a USB/VISA resource, or **Demo Simulator** to explore the app offline). The app starts with no controllers configured; add them here or load a profile (a profile stores the full hardware layout, including controller and channel order).
 4. Connect controllers using the **Connect** button in each controller's header, or **Connect All** in the top bar to open them all at once. (Connection is explicit — nothing talks to hardware until you press Connect.)
 
 ---

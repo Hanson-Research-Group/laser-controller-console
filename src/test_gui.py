@@ -118,6 +118,13 @@ def config_edit_checks():
     # Patch at class level so the startup autoload (bound in __init__) is a no-op.
     main.LDCMainWindow._load_last_profile = lambda self: None
     w = main.LDCMainWindow()
+    out = []
+    # Startup defaults: no controllers, but profile/ramp settings usable while
+    # disconnected; Connect All disabled with nothing configured.
+    out.append(("default has no controllers", w.num_channels == 0 and len(w.system.units) == 0))
+    out.append(("profile buttons usable while disconnected",
+                w.btn_save.isEnabled() and w.btn_load.isEnabled() and w.btn_clear_prof.isEnabled()))
+    out.append(("Connect All disabled with no controllers", not w.btn_connect.isEnabled()))
     w.config = {"units": [
         {"id": "u1", "kind": "combined", "driver": "ldc3908", "title": "ILX", "transport": {"type": "sim"}},
         {"id": "u2", "kind": "combined", "driver": "thorlabs_itc", "title": "Thor", "transport": {"type": "sim"}},
@@ -127,7 +134,6 @@ def config_edit_checks():
     ]}
     w._rebuild_system(); w.resize(1400, 800); w.show(); app.processEvents()
     titles = lambda: [u["title"] for u in w.config["units"]]
-    out = []
 
     # A non-ILX (single-channel) controller stays active even at a negative
     # temperature (which can legitimately happen) — no "no laser" rejection.
@@ -160,6 +166,28 @@ def config_edit_checks():
     out.append(("targets preserved across reorder", w.cards[ch3.idx].t_target.text() == "37.7"))
     w._delete_unit("u2")
     out.append(("delete controller", "Renamed" not in titles()))
+
+    # Controller + channel ORDER (and per-channel targets) survive a profile
+    # save -> wipe -> load round-trip.
+    import tempfile
+    from PySide6.QtWidgets import QFileDialog
+    order_titles_before = titles()
+    ilx = [u for u in w.system.units if u.id == "u1"][0]
+    ilx_order_before = [b.ch_num for b in ilx.channels]
+    path = os.path.join(tempfile.gettempdir(), "_lcc_rt_profile.txt")
+    QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: (path, "Text files (*.txt)"))
+    w.save_profile()
+    w.config = {"units": []}; w._rebuild_system(); app.processEvents()
+    w._load_profile_file(path); app.processEvents()
+    ilx2 = [u for u in w.system.units if u.id == "u1"][0]
+    out.append(("controller order persists in profile", titles() == order_titles_before))
+    out.append(("channel order persists in profile",
+                [b.ch_num for b in ilx2.channels] == ilx_order_before))
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
     w._unsaved = False  # avoid the close-time "save changes?" prompt (unstubbed file dialog)
     w.close()
     return out

@@ -677,7 +677,8 @@ class LDCMainWindow(QMainWindow):
         # Hardware layout: which controllers, their transports, and any T+I
         # pairings. This config is the source of truth; build_system() turns it
         # into a ControllerSystem (devices + units + flat channel bindings).
-        # Default: one ILX LDC-3908 in Demo mode, so the app starts usable offline.
+        # Starts empty (no controllers) — the user adds them via the Hardware
+        # dialog or by loading a profile.
         self.config = sysmod.default_config()
         self.system = sysmod.build_system(self.config)
         self.seq = Sequencer(stop=self.system.stop, events=QtSequenceEvents(self.bridge))
@@ -727,6 +728,7 @@ class LDCMainWindow(QMainWindow):
         self._apply_theme()
         self._update_hw_summary()
         self._refresh_conn_ui()
+        self._set_settings_locked(False)   # profile/ramp settings usable before connecting
         self._set_view_mode(True)
         QTimer.singleShot(0, self._load_last_profile)
         QTimer.singleShot(0, self._update_mode_estimates)
@@ -803,6 +805,11 @@ class LDCMainWindow(QMainWindow):
 
         self.table_header = self._build_table_header()
         self.table_header.setParent(self.container); self.table_header.hide()
+        self.empty_hint = QLabel("No controllers configured.\n\n"
+                                 "Click “⚙ Hardware…” to add one, or load a profile.")
+        self.empty_hint.setObjectName("unitMeta")
+        self.empty_hint.setAlignment(Qt.AlignCenter)
+        self.empty_hint.setParent(self.container); self.empty_hint.hide()
         self.cards = []
         self.unit_boxes = []
         self._build_channel_widgets()
@@ -1075,6 +1082,9 @@ class LDCMainWindow(QMainWindow):
 
     def _update_hw_summary(self):
         units = self.system.units
+        if not units:
+            self.lbl_hw.setText("No controllers — click ⚙ Hardware… to add one, or load a profile.")
+            return
         names = ", ".join(u.title for u in units)
         self.lbl_hw.setText(f"{len(units)} controller{'s' if len(units) != 1 else ''}: {names}")
 
@@ -1088,11 +1098,7 @@ class LDCMainWindow(QMainWindow):
             return
         dlg = HardwareDialog(self, self.config)
         if dlg.exec() == QDialog.Accepted:
-            cfg = dlg.result_config()
-            if not cfg.get("units"):
-                QMessageBox.warning(self, "No controllers", "Add at least one controller.")
-                return
-            self.config = cfg
+            self.config = dlg.result_config()   # may be empty (no controllers)
             self._rebuild_system()
             self._mark_unsaved()
 
@@ -1280,7 +1286,7 @@ class LDCMainWindow(QMainWindow):
         return out
 
     def _relayout(self, force=False):
-        if not getattr(self, "cards", None):
+        if not hasattr(self, "cards"):
             return
         shown = self._shown()
         shown_set = set(shown)
@@ -1303,6 +1309,14 @@ class LDCMainWindow(QMainWindow):
                 box.grid.takeAt(0)
             for c in range(max(4, box.grid.columnCount())):
                 box.grid.setColumnStretch(c, 0)
+
+        # Empty state: no controllers configured.
+        if not self.unit_boxes:
+            self.table_header.setVisible(False)
+            self.stack.addWidget(self.empty_hint)
+            self.empty_hint.setVisible(True)
+            return
+        self.empty_hint.setVisible(False)
 
         # Shared column header on top (table view only).
         if self._table_mode:
@@ -1490,6 +1504,7 @@ class LDCMainWindow(QMainWindow):
         all_conn = bool(units) and all(self._unit_connected(u) for u in units)
         any_conn = self._any_connected()
         self.btn_connect.setText("Disconnect All" if all_conn else "Connect All")
+        self.btn_connect.setEnabled(bool(units))
         self.btn_clear.setEnabled(any_conn)
         self.btn_run_all.setEnabled(any_conn and any(self._unit_scanned.get(u.id) for u in units))
         # Hardware layout may only change while fully disconnected.
@@ -1756,6 +1771,7 @@ class LDCMainWindow(QMainWindow):
         self.system.stop.reset()
         self._set_status("Status: Sequence Running...")
         self._lock_controls(False)
+        self._set_settings_locked(True)
         self.btn_stop.setEnabled(True)
         self.btn_emo.setEnabled(True)
         threading.Thread(target=self._run_sequence, args=(plans, t_ramp, i_ramp, t_off, mode), daemon=True).start()
@@ -1809,6 +1825,7 @@ class LDCMainWindow(QMainWindow):
     def _finish_sequence(self, n):
         self.is_executing = False
         self._lock_controls(True)
+        self._set_settings_locked(False)
         self.btn_stop.setEnabled(False)
         if self.system.stop.is_emo_requested:
             self._perform_emergency_shutdown()
@@ -1897,6 +1914,8 @@ class LDCMainWindow(QMainWindow):
     # Locking, theme, profiles
     # ------------------------------------------------------------------
     def _lock_controls(self, enabled):
+        # Per-channel + master + run controls: gated on connect/scan and locked
+        # during a run.
         for i in range(self.num_channels):
             if not self.populated[i]:
                 continue
@@ -1906,9 +1925,14 @@ class LDCMainWindow(QMainWindow):
         for b in self._master_buttons:
             b.setEnabled(enabled)
         self.btn_run_all.setEnabled(enabled)
-        self.mode_combo.setEnabled(enabled)
-        for w in (self.t_ramp, self.i_ramp, self.t_off, self.btn_save, self.btn_load, self.btn_clear_prof):
-            w.setEnabled(enabled)
+
+    def _set_settings_locked(self, locked):
+        """Ramp params, ramp mode, and the profile buttons are usable whenever a
+        run is NOT in progress — independent of whether controllers are connected
+        (you can load/save a profile, which defines the hardware, before connecting)."""
+        for w in (self.t_ramp, self.i_ramp, self.t_off, self.mode_combo,
+                  self.btn_save, self.btn_load, self.btn_clear_prof):
+            w.setEnabled(not locked)
 
     def _on_os_theme_changed(self, scheme):
         self.dark = (scheme == Qt.ColorScheme.Dark)
@@ -2000,6 +2024,11 @@ class LDCMainWindow(QMainWindow):
         if self.is_executing:
             QMessageBox.warning(self, "Busy", "Stop the running sequence before loading a profile.")
             return
+        if self._any_connected():
+            QMessageBox.information(self, "Disconnect first",
+                                    "Disconnect all controllers before loading a profile "
+                                    "(a profile defines the hardware configuration).")
+            return
         try:
             with open(path) as f:
                 data = json.load(f)
@@ -2042,8 +2071,16 @@ class LDCMainWindow(QMainWindow):
             QMessageBox.critical(self, "Load Error", f"Failed to load profile:\n{e}")
 
     def clear_profile(self):
+        if self.is_executing:
+            QMessageBox.warning(self, "Busy", "Stop the running sequence before clearing.")
+            return
+        if self._any_connected():
+            QMessageBox.information(self, "Disconnect first",
+                                    "Disconnect all controllers before clearing the configuration.")
+            return
         if QMessageBox.question(self, "Confirm Clear",
-                                "Clear the active profile and reset all settings to defaults?") != QMessageBox.Yes:
+                                "Clear the active profile and reset all settings to defaults "
+                                "(this removes all configured controllers)?") != QMessageBox.Yes:
             return
         self.config = sysmod.default_config()
         self._rebuild_system()
