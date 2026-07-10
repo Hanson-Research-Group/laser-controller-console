@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 import serial.tools.list_ports
 
 from laser_controller import LaserController
-from sequencer import Sequencer, SequenceEvents, ChannelPlan
+from sequencer import Sequencer, SequenceEvents, ChannelPlan, estimate_run_times
 import theme
 
 PREF_FILE = os.path.join(os.path.expanduser("~"), ".ldc_laser_control_prefs.json")
@@ -351,6 +351,7 @@ class LDCMainWindow(QMainWindow):
         self._emo_thread = None
         self.active_profile_path = ""
         self._unsaved = False
+        self._MODE_KEYS = ("sequential", "stage", "parallel")
         # Follow the OS light/dark theme (Qt 6.5+), and track live changes.
         hints = QApplication.instance().styleHints()
         try:
@@ -378,6 +379,7 @@ class LDCMainWindow(QMainWindow):
         self._apply_theme()
         self._set_view_mode(True)
         QTimer.singleShot(0, self._load_last_profile)
+        QTimer.singleShot(0, self._update_mode_estimates)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -530,8 +532,20 @@ class LDCMainWindow(QMainWindow):
         bottom.addWidget(self.btn_emo)
 
         run_col = QVBoxLayout(); run_col.setSpacing(6)
+        mode_row = QHBoxLayout(); mode_row.setSpacing(6)
+        mlbl = QLabel("Ramp mode:"); mlbl.setObjectName("hdr")
+        mode_row.addWidget(mlbl)
+        # Order matches self._MODE_KEYS; labels get a live "(~m:ss)" estimate suffix.
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems(["Per-channel", "By stage", "Parallel"])
+        self.mode_combo.setToolTip(
+            "Per-channel: finish each laser's temp→current before the next.\n"
+            "By stage: ramp all temperatures, then all currents (safe start/stop sync).\n"
+            "Parallel: ramp every laser at once (fastest). Validate on hardware.")
+        mode_row.addWidget(self.mode_combo, 1)
+        run_col.addLayout(mode_row)
         self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
-        self.btn_run_all.setMinimumHeight(56); self.btn_run_all.setMinimumWidth(210)
+        self.btn_run_all.setMinimumHeight(48); self.btn_run_all.setMinimumWidth(210)
         self.btn_run_all.setStyleSheet("background:#2e7d32; color:white; font-size:16px; font-weight:bold; border-radius:8px;")
         self.btn_run_all.clicked.connect(self.execute_all)
         run_col.addWidget(self.btn_run_all)
@@ -634,6 +648,7 @@ class LDCMainWindow(QMainWindow):
 
     def _on_enable_changed(self, *_):
         self._relayout(force=True)
+        self._update_mode_estimates()
 
     # ------------------------------------------------------------------
     # Bridge slots
@@ -838,6 +853,7 @@ class LDCMainWindow(QMainWindow):
         self._lock_controls(True)
         self.btn_scan.setEnabled(True)
         self.btn_run_all.setEnabled(True)
+        self._update_mode_estimates()
         if not self.telemetry_active:
             self.telemetry_active = True
             self.telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
@@ -898,6 +914,9 @@ class LDCMainWindow(QMainWindow):
             self._on_live_output(i, "TEC", "ON" if tec == 1 else "OFF")
         if las is not None:
             self._on_live_output(i, "LAS", "ON" if las == 1 else "OFF")
+        # Live readings feed the ETA (ΔT/ΔI from the current values).
+        if not self.is_executing:
+            self._update_mode_estimates()
 
     def _handle_connection_loss(self):
         self._set_status("Status: Connection Lost")
@@ -958,7 +977,9 @@ class LDCMainWindow(QMainWindow):
                                      tec_cmd=c.tec_cmd.currentText(), las_cmd=c.las_cmd.currentText(),
                                      t_target=tt, i_target=ti, targets_valid=valid))
 
-        self.total_estimated_time = self._estimate_time(plans, t_ramp, i_ramp, t_off)
+        mode = self._selected_mode()
+        infos = self._infos_from_cards([p.ch_num for p in plans if p.targets_valid])
+        self.total_estimated_time = estimate_run_times(infos, t_ramp, i_ramp, t_off).get(mode, 0.0)
         self.is_executing = True
         self.ctl.is_stop_requested = False
         self.ctl.is_emo_requested = False
@@ -966,43 +987,52 @@ class LDCMainWindow(QMainWindow):
         self._lock_controls(False)
         self.btn_stop.setEnabled(True)
         self.btn_emo.setEnabled(True)
-        threading.Thread(target=self._run_sequence, args=(plans, t_ramp, i_ramp, t_off), daemon=True).start()
+        threading.Thread(target=self._run_sequence, args=(plans, t_ramp, i_ramp, t_off, mode), daemon=True).start()
 
-    def _estimate_time(self, plans, t_ramp, i_ramp, t_off):
-        TEC_ON, LAS_ON, LAS_OFF, TEC_OFF = 1.0, 4.0, 1.5, 1.0
-        total = 0.0
-        for p in plans:
-            c = self.cards[p.idx]
+    # --- Ramp-mode selection + live time estimates ---
+    def _selected_mode(self):
+        return self._MODE_KEYS[self.mode_combo.currentIndex()]
+
+    def _active_channels(self):
+        return [i + 1 for i in range(self.num_channels)
+                if self.populated[i] and self.cards[i].enable.isChecked()]
+
+    def _infos_from_cards(self, ch_nums):
+        infos = []
+        for ch_num in ch_nums:
+            c = self.cards[ch_num - 1]
             try:
+                tt = float(c.t_target.text()); ti = float(c.i_target.text())
                 ct = float(c.live_t.text()); ci = float(c.live_i.text())
-            except Exception:
-                ct, ci = 22.0, 0.0
-            lt, ll = c.live_tec.text(), c.live_las.text()
-            tc, lc = p.tec_cmd, p.las_cmd
-            if lt == "OFF" and ll == "OFF":
-                if tc == "ON" and lc == "OFF":
-                    total += TEC_ON + abs(p.t_target - ct) / t_ramp
-                elif tc == "ON" and lc == "ON":
-                    total += TEC_ON + abs(p.t_target - ct) / t_ramp + LAS_ON + abs(p.i_target) / i_ramp
-            elif lt == "ON" and ll == "OFF":
-                if tc == "ON" and lc == "ON":
-                    total += abs(p.t_target - ct) / t_ramp + LAS_ON + abs(p.i_target) / i_ramp
-                elif tc == "OFF" and lc == "OFF":
-                    total += abs(t_off - ct) / t_ramp + TEC_OFF
-                elif tc == "ON" and lc == "OFF":
-                    total += abs(p.t_target - ct) / t_ramp
-            elif lt == "ON" and ll == "ON":
-                if tc == "ON" and lc == "OFF":
-                    total += abs(ci) / i_ramp + LAS_OFF + abs(p.t_target - ct) / t_ramp
-                elif tc == "OFF" and lc == "OFF":
-                    total += abs(ci) / i_ramp + LAS_OFF + abs(t_off - ct) / t_ramp + TEC_OFF
-                elif tc == "ON" and lc == "ON":
-                    total += abs(p.t_target - ct) / t_ramp + abs(p.i_target - ci) / i_ramp
-        return total
+            except ValueError:
+                continue
+            infos.append(dict(curr_t=ct, curr_i=ci, t_target=tt, i_target=ti,
+                              tec_cmd=c.tec_cmd.currentText(), las_cmd=c.las_cmd.currentText(),
+                              live_tec=c.live_tec.text(), live_las=c.live_las.text()))
+        return infos
 
-    def _run_sequence(self, plans, t_ramp, i_ramp, t_off):
+    def _update_mode_estimates(self):
+        if not hasattr(self, "mode_combo"):
+            return
+        names = ["Per-channel", "By stage", "Parallel"]
+        try:
+            tr = float(self.t_ramp.text()); ir = float(self.i_ramp.text()); to = float(self.t_off.text())
+        except (ValueError, AttributeError):
+            tr = ir = to = None
+        infos = self._infos_from_cards(self._active_channels()) if hasattr(self, "cards") else []
+        est = None
+        if tr and ir and tr > 0 and ir > 0 and infos:
+            est = estimate_run_times(infos, tr, ir, to)
+        for idx, key in enumerate(self._MODE_KEYS):
+            if est:
+                secs = est[key]
+                self.mode_combo.setItemText(idx, f"{names[idx]}  (~{int(secs // 60)}:{int(secs % 60):02d})")
+            else:
+                self.mode_combo.setItemText(idx, names[idx])
+
+    def _run_sequence(self, plans, t_ramp, i_ramp, t_off, mode):
         self.sequence_start_time = time.time()
-        self.seq.run(plans, t_ramp, i_ramp, t_off)
+        self.seq.run(plans, t_ramp, i_ramp, t_off, mode=mode)
         self._post(self._finish_sequence, len(plans))
 
     def _finish_sequence(self, n):
@@ -1097,6 +1127,7 @@ class LDCMainWindow(QMainWindow):
             b.setEnabled(enabled)
         self.btn_run_all.setEnabled(enabled)
         self.btn_scan.setEnabled(enabled)
+        self.mode_combo.setEnabled(enabled)
         for w in (self.t_ramp, self.i_ramp, self.t_off, self.btn_save, self.btn_load, self.btn_clear_prof):
             w.setEnabled(enabled)
 
@@ -1133,6 +1164,8 @@ class LDCMainWindow(QMainWindow):
         pal.setColor(QPalette.Highlight, QColor("#1976D2"))
         pal.setColor(QPalette.HighlightedText, QColor("#ffffff"))
         combos = [self.com_combo]
+        if hasattr(self, "mode_combo"):
+            combos.append(self.mode_combo)
         for c in getattr(self, "cards", []):
             combos += [c.tec_cmd, c.las_cmd]
         for combo in combos:
@@ -1141,6 +1174,8 @@ class LDCMainWindow(QMainWindow):
             view.setPalette(pal)
 
     def _mark_unsaved(self, *_):
+        # Any edit that could change the run also changes the time estimates.
+        self._update_mode_estimates()
         if not self._unsaved:
             self._unsaved = True
             t = self.lbl_profile.text()

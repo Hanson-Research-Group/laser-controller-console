@@ -12,7 +12,7 @@ or under pytest:
 import time
 
 from laser_controller import LaserController
-from sequencer import Sequencer, SequenceEvents, ChannelPlan
+from sequencer import Sequencer, SequenceEvents, ChannelPlan, estimate_run_times
 
 
 class RecordingEvents(SequenceEvents):
@@ -172,6 +172,78 @@ def test_invalid_targets_skip_channel_without_fault():
     assert not ev.kinds("fault") and not ev.kinds("halted")
     assert c.sim_state['TEC_ON'][4] == 1   # the good channel still ran
     assert not c.is_stop_requested
+
+
+# ----------------------------------------------------------------------------
+# Multi-channel modes: parallel + stage (the installed sim channels are 1,2,5).
+# ----------------------------------------------------------------------------
+_INSTALLED = [(0, 1), (1, 2), (4, 5)]
+
+
+def _bring_up_plans():
+    return [ChannelPlan(idx=i, ch_num=n, tec_cmd="ON", las_cmd="ON",
+                        t_target=23.0, i_target=5.0, targets_valid=True)
+            for i, n in _INSTALLED]
+
+
+def test_parallel_bring_up_all_channels():
+    c, ev, seq = _rig()
+    seq.run(_bring_up_plans(), FAST_T, FAST_I, 22.0, mode="parallel")
+    for i, _ in _INSTALLED:
+        assert c.sim_state['TEC_ON'][i] == 1 and c.sim_state['LAS_ON'][i] == 1, i
+        assert abs(c.sim_state['T_actual'][i] - 23.0) < 0.1
+        assert abs(c.sim_state['I_actual'][i] - 5.0) < 0.1
+    assert not c.is_stop_requested
+
+
+def test_stage_bring_up_all_channels():
+    c, ev, seq = _rig()
+    seq.run(_bring_up_plans(), FAST_T, FAST_I, 22.0, mode="stage")
+    for i, _ in _INSTALLED:
+        assert c.sim_state['TEC_ON'][i] == 1 and c.sim_state['LAS_ON'][i] == 1, i
+        assert abs(c.sim_state['T_actual'][i] - 23.0) < 0.1
+        assert abs(c.sim_state['I_actual'][i] - 5.0) < 0.1
+    assert not c.is_stop_requested
+
+
+def test_stage_shutdown_all_channels():
+    c, ev, seq = _rig()
+    for i, _ in _INSTALLED:
+        c.sim_state['TEC_ON'][i] = 1
+        c.sim_state['LAS_ON'][i] = 1
+        c.sim_state['T_actual'][i] = 30.0
+        c.sim_state['I_actual'][i] = 8.0
+    plans = [ChannelPlan(idx=i, ch_num=n, tec_cmd="OFF", las_cmd="OFF",
+                         t_target=0.0, i_target=0.0, targets_valid=True)
+             for i, n in _INSTALLED]
+    seq.run(plans, FAST_T, FAST_I, 22.0, mode="stage")
+    for i, _ in _INSTALLED:
+        assert c.sim_state['LAS_ON'][i] == 0 and c.sim_state['TEC_ON'][i] == 0, i
+        assert abs(c.sim_state['I_actual'][i] - 0.0) < 0.1
+        assert abs(c.sim_state['T_actual'][i] - 22.0) < 0.1   # ramped to t_off
+
+
+def test_parallel_fault_in_one_channel_aborts_run():
+    c, ev, seq = _rig()
+    plans = [
+        ChannelPlan(idx=0, ch_num=1, tec_cmd="ON", las_cmd="ON", t_target=23.0, i_target=5.0, targets_valid=True),
+        ChannelPlan(idx=1, ch_num=2, tec_cmd="ON", las_cmd="ON", t_target=23.0, i_target=999.0, targets_valid=True),  # over I limit
+    ]
+    seq.run(plans, FAST_T, FAST_I, 22.0, mode="parallel")
+    assert c.is_stop_requested
+    assert c.sim_state['LAS_ON'][1] == 0   # the over-limit channel never lased
+    assert any(e[0] == "fault" for e in ev.events)
+
+
+def test_estimate_parallel_is_faster_than_sequential():
+    infos = [dict(curr_t=22.0, curr_i=0.0, t_target=40.0, i_target=60.0,
+                  tec_cmd="ON", las_cmd="ON", live_tec="OFF", live_las="OFF")
+             for _ in range(4)]
+    est = estimate_run_times(infos, 0.1, 0.5, 22.0)
+    assert est["sequential"] > 0
+    assert est["stage"] == est["sequential"]          # same work, reordered
+    assert est["parallel"] < est["sequential"]        # overlap saves time
+    assert estimate_run_times([], 0.1, 0.5, 22.0)["sequential"] == 0.0
 
 
 if __name__ == "__main__":

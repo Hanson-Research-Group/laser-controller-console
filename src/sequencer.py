@@ -3,22 +3,38 @@
 UI-agnostic laser ramp / sequence engine for the Newport LDC-3908.
 
 This is the safety-critical control logic — the per-channel safety state machine
-and the temperature/current ramps — lifted out of the Tk GUI. It drives hardware
-through a LaserController (self.ctl) and reports everything the UI needs to draw
-through a SequenceEvents sink (self.events) instead of touching widgets directly.
+and the temperature/current ramps — independent of any GUI. It drives hardware
+through a LaserController and reports everything the UI needs to draw through a
+SequenceEvents sink instead of touching widgets directly.
+
+Three execution modes (all share the SAME per-channel safety sequence and the
+SAME ramp primitives, so interlocks are identical in every mode):
+
+  * "sequential" (default) — one channel completes its full temp->current
+    sequence before the next starts.
+  * "stage"                — all channels move through the temperature stage,
+    then all through the current stage. Stages are auto-ordered
+    (current-down -> temperature -> current-up) so the TEC-before-LAS interlock
+    holds for both start-up and shut-down.
+  * "parallel"             — every channel ramps at once, one worker thread each.
+    Each serial transaction re-selects its channel under the lock; the long
+    ramp/settle pauses happen outside the lock, so they overlap across channels.
+
+Serial I/O is routed through a per-channel "bus" so the state machine code is
+mode-agnostic: _SequentialBus (caller holds the lock, channel pre-selected) vs
+_ParallelBus (per-transaction re-select + lock).
 
 No GUI imports. Exercised head-less in test_sequencer.py against the simulator.
 """
 
 import math
+import threading
 import time
 from dataclasses import dataclass
 from typing import List
 
 
 # --- Semantic status / LED kinds ----------------------------------------------
-# The engine names *intent*, not color. The GUI (theme.py) maps these kinds to
-# actual colors for the active light/dark theme, keeping this module UI-agnostic.
 C_INIT = "init"
 C_OK = "ok"
 C_FAULT = "fault"
@@ -28,16 +44,24 @@ LED_RAMP = "ramp"
 LED_OK = "ok"
 LED_FAULT = "fault"
 
+# Fixed per-transition overheads (seconds) used by the run-time estimator.
+_TEC_ON_TIME = 1.0
+_LAS_ON_TIME = 4.0
+_LAS_OFF_TIME = 1.5
+_TEC_OFF_TIME = 1.0
+# Fraction of ramp movement time that is un-overlappable serial traffic; used to
+# approximate parallel wall-clock (the rest — the settle pauses — overlaps).
+_PARALLEL_SERIAL_FRAC = 0.4
+
 
 class SequenceEvents:
     """Sink for everything the sequencer wants the UI to reflect. Default no-ops;
-    the GUI subclasses this (marshalling each call onto the Tk main thread), and
-    tests subclass it to record calls."""
+    the GUI subclasses this (marshalling each call onto the GUI thread), and tests
+    subclass it to record calls."""
 
     def on_status(self, idx, text, kind):
         """Channel idx's status line should read `text`, styled by semantic
-        `kind` ("init"/"ok"/"warn"/"fault"/"ramp_t"/"ramp_i"). The GUI maps the
-        kind to a themed color."""
+        `kind` ("init"/"ok"/"warn"/"fault"/"ramp_t"/"ramp_i")."""
 
     def on_led(self, idx, kind):
         """Channel idx's LED should show semantic `kind` ("ramp"/"ok"/"fault")."""
@@ -71,266 +95,524 @@ class ChannelPlan:
     targets_valid: bool
 
 
+# ----------------------------------------------------------------------------
+# Run-time estimate (used by the GUI to label the mode selector).
+# ----------------------------------------------------------------------------
+def _channel_cost(info, t_ramp, i_ramp, t_off):
+    """Return (movement_seconds, overhead_seconds) for one channel, mirroring the
+    same branch logic the sequencer executes. `info` is a dict with keys
+    curr_t, curr_i, t_target, i_target, tec_cmd, las_cmd, live_tec, live_las."""
+    ct, ci = info["curr_t"], info["curr_i"]
+    tt, ti = info["t_target"], info["i_target"]
+    tc, lc = info["tec_cmd"], info["las_cmd"]
+    lt, ll = info["live_tec"], info["live_las"]
+    move = 0.0
+    ovh = 0.0
+    if lt == "OFF" and ll == "OFF":
+        if tc == "ON" and lc == "OFF":
+            ovh += _TEC_ON_TIME; move += abs(tt - ct) / t_ramp
+        elif tc == "ON" and lc == "ON":
+            ovh += _TEC_ON_TIME; move += abs(tt - ct) / t_ramp
+            ovh += _LAS_ON_TIME; move += abs(ti) / i_ramp
+    elif lt == "ON" and ll == "OFF":
+        if tc == "ON" and lc == "ON":
+            move += abs(tt - ct) / t_ramp
+            ovh += _LAS_ON_TIME; move += abs(ti) / i_ramp
+        elif tc == "OFF" and lc == "OFF":
+            move += abs(t_off - ct) / t_ramp; ovh += _TEC_OFF_TIME
+        elif tc == "ON" and lc == "OFF":
+            move += abs(tt - ct) / t_ramp
+    elif lt == "ON" and ll == "ON":
+        if tc == "ON" and lc == "OFF":
+            move += abs(ci) / i_ramp; ovh += _LAS_OFF_TIME; move += abs(tt - ct) / t_ramp
+        elif tc == "OFF" and lc == "OFF":
+            move += abs(ci) / i_ramp; ovh += _LAS_OFF_TIME
+            move += abs(t_off - ct) / t_ramp; ovh += _TEC_OFF_TIME
+        elif tc == "ON" and lc == "ON":
+            move += abs(tt - ct) / t_ramp; move += abs(ti - ci) / i_ramp
+    return move, ovh
+
+
+def estimate_run_times(infos, t_ramp, i_ramp, t_off):
+    """Approximate wall-clock seconds for each mode. Sequential and stage do the
+    same total work (stage just reorders it); parallel overlaps the settle pauses
+    but is floored by the shared serial traffic and by the single longest channel.
+    Returns {"sequential": s, "stage": s, "parallel": s}. Best-effort — clearly
+    an estimate."""
+    if t_ramp <= 0 or i_ramp <= 0 or not infos:
+        return {"sequential": 0.0, "stage": 0.0, "parallel": 0.0}
+    costs = [_channel_cost(i, t_ramp, i_ramp, t_off) for i in infos]
+    moves = [m for m, _ in costs]
+    ovhs = [o for _, o in costs]
+    total = sum(moves) + sum(ovhs)
+    seq = total
+    stage = total  # same work, reordered by stage
+    par_move = max(max(moves), _PARALLEL_SERIAL_FRAC * sum(moves)) if moves else 0.0
+    par = min(par_move + (max(ovhs) if ovhs else 0.0), seq)
+    return {"sequential": seq, "stage": stage, "parallel": par}
+
+
+# ----------------------------------------------------------------------------
+# Per-channel serial buses.
+# ----------------------------------------------------------------------------
+class _SequentialBus:
+    """SEQUENTIAL/STAGE mode: the caller holds the serial lock and has selected
+    the channel, so ops delegate straight to the controller (original behavior)."""
+    def __init__(self, ctl, ch_num):
+        self.ctl = ctl
+        self.ch_num = ch_num
+        self.idx = ch_num - 1
+
+    def send(self, cmd):
+        self.ctl.send_cmd(cmd)
+
+    def query(self, cmd):
+        return self.ctl.query_cmd(cmd)
+
+    def cmd_pause(self, cmd):
+        self.ctl.cmd_pause(cmd)
+
+    def pause(self, t):
+        self.ctl.safe_pause(t)
+
+    def verify(self, cmd, expected, msg):
+        self.ctl.verify_hw_state(cmd, expected, msg)
+
+    def check_errors(self):
+        return self.ctl.check_controller_errors(self.ch_num)
+
+
+class _ParallelBus:
+    """PARALLEL mode: no lock held between ops. Each transaction re-selects this
+    channel and holds the serial lock only for that single transaction, so
+    channels interleave on the bus and their pauses (outside the lock) overlap.
+    Per-channel safety ordering is preserved — each channel runs the full state
+    machine in its own thread."""
+    SETTLE = 0.15  # channel-switch settle before each transaction
+
+    def __init__(self, ctl, ch_num):
+        self.ctl = ctl
+        self.ch_num = ch_num
+        self.idx = ch_num - 1
+
+    def send(self, cmd):
+        with self.ctl.serial_lock:
+            self.ctl.send_cmd(f"CHAN {self.ch_num}")
+            time.sleep(self.SETTLE)
+            self.ctl.send_cmd(cmd)
+
+    def query(self, cmd):
+        with self.ctl.serial_lock:
+            self.ctl.send_cmd(f"CHAN {self.ch_num}")
+            time.sleep(self.SETTLE)
+            return self.ctl.query_cmd(cmd)
+
+    def cmd_pause(self, cmd):
+        self.send(cmd)
+        time.sleep(0.15)  # pause outside the lock so other channels proceed
+
+    def pause(self, t):
+        time.sleep(t)
+        if self.ctl.is_stop_requested:
+            raise RuntimeError("HALT")
+
+    def verify(self, cmd, expected, msg):
+        with self.ctl.serial_lock:
+            self.ctl.send_cmd(f"CHAN {self.ch_num}")
+            time.sleep(self.SETTLE)
+            self.ctl.verify_hw_state(cmd, expected, msg)
+
+    def check_errors(self):
+        with self.ctl.serial_lock:
+            return self.ctl.check_controller_errors(self.ch_num)
+
+
 class Sequencer:
     def __init__(self, controller, events=None):
         self.ctl = controller
         self.events = events or SequenceEvents()
 
     # ----------------------------------------------------
-    # TOP-LEVEL SEQUENCE LOOP
+    # TOP-LEVEL DISPATCH
     # ----------------------------------------------------
-    def run(self, plans: List[ChannelPlan], t_ramp, i_ramp, t_off_target):
-        """Execute each channel plan in order. Aborts the whole run on the first
-        fault/halt (setting the controller's stop flag). All UI feedback goes
-        through self.events. Returns nothing — the caller inspects the controller
-        flags (is_stop_requested / is_emo_requested) for final status, exactly as
-        before."""
+    def run(self, plans: List[ChannelPlan], t_ramp, i_ramp, t_off_target, mode="sequential"):
+        """Execute the plans in the chosen mode. Aborts on the first fault/halt
+        (setting the controller's stop flag). All feedback goes through events;
+        the caller inspects the controller flags for final status."""
+        if mode == "parallel":
+            self._run_parallel(plans, t_ramp, i_ramp, t_off_target)
+        elif mode == "stage":
+            self._run_stage(plans, t_ramp, i_ramp, t_off_target)
+        else:
+            self._run_sequential(plans, t_ramp, i_ramp, t_off_target)
+
+    def _handle_exception(self, plan, e):
+        if "HALT" in str(e):
+            self.events.on_channel_halted(plan.idx)
+        else:
+            self.events.on_channel_fault(plan.idx, str(e))
+
+    def _report_invalid(self, plans):
+        valid = []
+        for p in plans:
+            if p.targets_valid:
+                valid.append(p)
+            else:
+                self.events.on_status(p.idx, "Invalid targets", C_FAULT)
+        return valid
+
+    # ----------------------------------------------------
+    # MODE: SEQUENTIAL (per channel)
+    # ----------------------------------------------------
+    def _run_sequential(self, plans, t_ramp, i_ramp, t_off):
         for plan in plans:
             if self.ctl.is_stop_requested:
                 break
-
-            idx = plan.idx
-            ch_num = plan.ch_num
-
             if not plan.targets_valid:
-                self.events.on_status(idx, "Invalid targets", C_FAULT)
+                self.events.on_status(plan.idx, "Invalid targets", C_FAULT)
                 continue
-
-            tec_on_off = plan.tec_cmd
-            las_on_off = plan.las_cmd
-            t_on_target = plan.t_target
-            i_on_target = plan.i_target
-
             try:
-                # Lock serial during execution steps
                 with self.ctl.serial_lock:
-                    self.ctl.send_cmd(f"CHAN {ch_num}")
+                    self.ctl.send_cmd(f"CHAN {plan.ch_num}")
                     time.sleep(0.1)
-
-                    # Read hardware limits from controller
-                    h_i_lim_str = self.ctl.query_cmd("LAS:LIM:I?")
-                    try:
-                        h_i_lim = float(h_i_lim_str)
-                    except Exception:
-                        h_i_lim = 500.0
-
-                    h_t_lim_str = self.ctl.query_cmd("TEC:LIM:THI?")
-                    try:
-                        h_t_lim = float(h_t_lim_str)
-                    except Exception:
-                        h_t_lim = 80.0
-
-                    # Safety Validation Checks
-                    if tec_on_off == "ON" and not math.isnan(h_t_lim) and t_on_target > h_t_lim:
-                        raise ValueError(f"Target T ({t_on_target:.1f}°C) exceeds limit ({h_t_lim:.1f}°C)")
-
-                    if las_on_off == "ON" and not math.isnan(h_i_lim) and i_on_target > h_i_lim:
-                        raise ValueError(f"Target I ({i_on_target:.1f}mA) exceeds limit ({h_i_lim:.1f}mA)")
-
-                    if tec_on_off == "OFF" and las_on_off == "ON":
-                        raise ValueError("TEC must be ON for LAS to be ON.")
-
-                    # Core execution logic
-                    self.run_control_core(ch_num, tec_on_off, t_on_target, t_off_target,
-                                          las_on_off, i_on_target, t_ramp, i_ramp)
-
-                    # Final check for silent hardware error
-                    has_err, err_str = self.ctl.check_controller_errors(ch_num)
-                    if has_err:
-                        raise RuntimeError(err_str)
-
+                    bus = _SequentialBus(self.ctl, plan.ch_num)
+                    self._run_one(bus, plan, t_ramp, i_ramp, t_off)
             except Exception as e:
-                err_msg = str(e)
-                if "HALT" in err_msg:
-                    self.events.on_channel_halted(idx)
-                else:
-                    self.events.on_channel_fault(idx, err_msg)
-
+                self._handle_exception(plan, e)
                 self.ctl.is_stop_requested = True
                 break
 
     # ----------------------------------------------------
-    # PER-CHANNEL SAFETY STATE MACHINE
+    # MODE: PARALLEL (one worker thread per channel)
     # ----------------------------------------------------
-    def run_control_core(self, ch_num, tec_on_off, t_on_target, t_off_target,
+    def _run_parallel(self, plans, t_ramp, i_ramp, t_off):
+        valid = self._report_invalid(plans)
+
+        def worker(plan):
+            if self.ctl.is_stop_requested:
+                return
+            bus = _ParallelBus(self.ctl, plan.ch_num)
+            try:
+                self._run_one(bus, plan, t_ramp, i_ramp, t_off)
+            except Exception as e:
+                self._handle_exception(plan, e)
+                self.ctl.is_stop_requested = True  # abort the other channels
+
+        threads = [threading.Thread(target=worker, args=(p,), daemon=True) for p in valid]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    # ----------------------------------------------------
+    # MODE: STAGE (all channels per stage; auto-ordered for interlock safety)
+    # ----------------------------------------------------
+    def _run_stage(self, plans, t_ramp, i_ramp, t_off):
+        valid = self._report_invalid(plans)
+        # Order matters for safety: prepare -> drop current on anything turning off
+        # -> move all temperatures -> raise current on anything turning on.
+        for stage_fn in (self._stage_init, self._stage_current_down,
+                         self._stage_temperature, self._stage_current_up,
+                         self._stage_finalize):
+            for plan in valid:
+                if self.ctl.is_stop_requested:
+                    return
+                try:
+                    with self.ctl.serial_lock:
+                        self.ctl.send_cmd(f"CHAN {plan.ch_num}")
+                        time.sleep(0.1)
+                        bus = _SequentialBus(self.ctl, plan.ch_num)
+                        stage_fn(bus, plan, t_ramp, i_ramp, t_off)
+                except Exception as e:
+                    self._handle_exception(plan, e)
+                    self.ctl.is_stop_requested = True
+                    return
+
+    def _stage_init(self, bus, plan, t_ramp, i_ramp, t_off):
+        self._validate_limits(bus, plan)
+        idx = bus.idx
+        self.events.on_status(idx, "Initializing...", C_INIT)
+        self.events.on_led(idx, LED_RAMP)
+        self._align_and_disable_mod(bus)
+        tec, las = self._read_states(bus)
+        if tec == 0 and las == 1:
+            self._critical_laser_without_tec(bus, i_ramp)
+
+    def _stage_current_down(self, bus, plan, t_ramp, i_ramp, t_off):
+        if plan.las_cmd != "OFF":
+            return
+        try:
+            las = int(float(bus.query("LAS:OUT?")))
+        except Exception:
+            las = -1
+        if las == 1:
+            self.ramp_current(bus, 0.0, i_ramp)
+            bus.pause(0.15)
+            bus.send("LAS:OUTPUT 0")
+            bus.pause(0.2)
+            bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+            self.events.on_live_output(bus.idx, "LAS", "OFF")
+            bus.pause(0.5)
+
+    def _stage_temperature(self, bus, plan, t_ramp, i_ramp, t_off):
+        try:
+            tec = int(float(bus.query("TEC:OUT?")))
+        except Exception:
+            tec = -1
+        if plan.tec_cmd == "ON":
+            if tec == 0:
+                self.tec_temp_tset_tcurr(bus)
+                bus.pause(0.15)
+                bus.send("TEC:OUTPUT 1")
+                bus.pause(0.2)
+                bus.verify("TEC:OUT?", 1, "TEC ON acknowledge failed.")
+                self.events.on_live_output(bus.idx, "TEC", "ON")
+                bus.pause(0.15)
+            self.ramp_temp(bus, plan.t_target, t_ramp)
+        else:  # target TEC OFF (laser already off from the current-down stage)
+            if tec == 1:
+                self.ramp_temp(bus, t_off, t_ramp)
+                bus.pause(0.15)
+                bus.send("TEC:OUTPUT 0")
+                bus.pause(0.2)
+                bus.verify("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
+                self.events.on_live_output(bus.idx, "TEC", "OFF")
+                bus.pause(0.5)
+
+    def _stage_current_up(self, bus, plan, t_ramp, i_ramp, t_off):
+        if plan.las_cmd != "ON":
+            return
+        try:
+            las = int(float(bus.query("LAS:OUT?")))
+        except Exception:
+            las = -1
+        if las == 0:
+            bus.send("LAS:LDI 0.0")
+            bus.pause(0.15)
+            bus.send("LAS:OUTPUT 1")
+            bus.pause(0.2)
+            bus.verify("LAS:OUT?", 1, "LAS ON acknowledge failed.")
+            self.events.on_live_output(bus.idx, "LAS", "ON")
+            bus.pause(2.5)  # mandatory safety lock delay
+            has_err, err = bus.check_errors()
+            if has_err:
+                raise RuntimeError(err)
+        self.ramp_current(bus, plan.i_target, i_ramp)
+
+    def _stage_finalize(self, bus, plan, t_ramp, i_ramp, t_off):
+        if not self.ctl.is_stop_requested:
+            self.final_check(bus)
+
+    # ----------------------------------------------------
+    # ONE CHANNEL (sequential / parallel) — full state machine
+    # ----------------------------------------------------
+    def _run_one(self, bus, plan, t_ramp, i_ramp, t_off):
+        self._validate_limits(bus, plan)
+        self.run_control_core(bus, plan.tec_cmd, plan.t_target, t_off,
+                              plan.las_cmd, plan.i_target, t_ramp, i_ramp)
+        has_err, err_str = bus.check_errors()
+        if has_err:
+            raise RuntimeError(err_str)
+
+    def _validate_limits(self, bus, plan):
+        try:
+            h_i_lim = float(bus.query("LAS:LIM:I?"))
+        except Exception:
+            h_i_lim = 500.0
+        try:
+            h_t_lim = float(bus.query("TEC:LIM:THI?"))
+        except Exception:
+            h_t_lim = 80.0
+        if plan.tec_cmd == "ON" and not math.isnan(h_t_lim) and plan.t_target > h_t_lim:
+            raise ValueError(f"Target T ({plan.t_target:.1f}°C) exceeds limit ({h_t_lim:.1f}°C)")
+        if plan.las_cmd == "ON" and not math.isnan(h_i_lim) and plan.i_target > h_i_lim:
+            raise ValueError(f"Target I ({plan.i_target:.1f}mA) exceeds limit ({h_i_lim:.1f}mA)")
+        if plan.tec_cmd == "OFF" and plan.las_cmd == "ON":
+            raise ValueError("TEC must be ON for LAS to be ON.")
+
+    def _align_and_disable_mod(self, bus):
+        chan_curr = -1
+        for _ in range(3):
+            try:
+                chan_curr = int(bus.query("CHAN?"))
+                if chan_curr == bus.ch_num:
+                    break
+            except Exception:
+                pass
+            bus.pause(0.15)
+            bus.cmd_pause(f"CHAN {bus.ch_num}")
+        if chan_curr != bus.ch_num:
+            raise RuntimeError(f"Ch. switch to {bus.ch_num} timed out or failed.")
+        bus.cmd_pause("LAS:MOD 0")
+        bus.pause(0.1)
+        bus.verify("LAS:MOD?", 0, "Hardware failed to disable external modulation.")
+
+    def _read_states(self, bus):
+        try:
+            tec = int(float(bus.query("TEC:OUT?")))
+        except Exception:
+            tec = -1
+        try:
+            las = int(float(bus.query("LAS:OUT?")))
+        except Exception:
+            las = -1
+        return tec, las
+
+    def _critical_laser_without_tec(self, bus, i_ramp):
+        self.events.on_status(bus.idx, "CRITICAL: Laser ON without TEC. Ramping down safely.", C_FAULT)
+        self.ramp_current(bus, 0.0, i_ramp)
+        bus.pause(0.15)
+        bus.send("LAS:OUTPUT 0")
+        bus.pause(0.2)
+        bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+        self.events.on_live_output(bus.idx, "LAS", "OFF")
+        raise RuntimeError(f"CRITICAL FAULT CH {bus.ch_num}: Laser ON while TEC OFF. Ramped down laser safely.")
+
+    def run_control_core(self, bus, tec_on_off, t_on_target, t_off_target,
                          las_on_off, i_on_target, t_ramp, i_ramp):
-        idx = ch_num - 1
+        idx = bus.idx
+        ch_num = bus.ch_num
 
         self.events.on_status(idx, "Initializing...", C_INIT)
         self.events.on_led(idx, LED_RAMP)
 
-        # 1. Command Verification Alignment
-        chan_curr = -1
-        for retry in range(3):
-            try:
-                chan_curr = int(self.ctl.query_cmd("CHAN?"))
-                if chan_curr == ch_num:
-                    break
-            except Exception:
-                pass
-            self.ctl.safe_pause(0.15)
-            self.ctl.cmd_pause(f"CHAN {ch_num}")
+        self._align_and_disable_mod(bus)
+        tec_curr_status, las_curr_status = self._read_states(bus)
 
-        if chan_curr != ch_num:
-            raise RuntimeError(f"Ch. switch to {ch_num} timed out or failed.")
-
-        self.ctl.cmd_pause("LAS:MOD 0")
-        self.ctl.safe_pause(0.1)
-        self.ctl.verify_hw_state("LAS:MOD?", 0, "Hardware failed to disable external modulation.")
-
-        # 2. Read Current Status
-        try:
-            tec_curr_status = int(float(self.ctl.query_cmd("TEC:OUT?")))
-        except Exception:
-            tec_curr_status = -1
-
-        try:
-            las_curr_status = int(float(self.ctl.query_cmd("LAS:OUT?")))
-        except Exception:
-            las_curr_status = -1
-
-        # Safety Routing State Machine Matching MATLAB
         if tec_curr_status == 0 and las_curr_status == 0:
             if tec_on_off == "ON" and las_on_off == "OFF":
-                self.tec_temp_tset_tcurr()
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("TEC:OUTPUT 1")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("TEC:OUT?", 1, "TEC ON acknowledge failed.")
+                self.tec_temp_tset_tcurr(bus)
+                bus.pause(0.15)
+                bus.send("TEC:OUTPUT 1")
+                bus.pause(0.2)
+                bus.verify("TEC:OUT?", 1, "TEC ON acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "ON")
-                self.ctl.safe_pause(0.15)
-                self.ramp_temp(t_on_target, t_ramp, idx)
+                bus.pause(0.15)
+                self.ramp_temp(bus, t_on_target, t_ramp)
 
             elif tec_on_off == "ON" and las_on_off == "ON":
-                self.tec_temp_tset_tcurr()
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("TEC:OUTPUT 1")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("TEC:OUT?", 1, "TEC ON acknowledge failed.")
+                self.tec_temp_tset_tcurr(bus)
+                bus.pause(0.15)
+                bus.send("TEC:OUTPUT 1")
+                bus.pause(0.2)
+                bus.verify("TEC:OUT?", 1, "TEC ON acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "ON")
-                self.ctl.safe_pause(0.15)
-                self.ramp_temp(t_on_target, t_ramp, idx)
+                bus.pause(0.15)
+                self.ramp_temp(bus, t_on_target, t_ramp)
 
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("LAS:LDI 0.0")
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("LAS:OUTPUT 1")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("LAS:OUT?", 1, "LAS ON acknowledge failed.")
+                bus.pause(0.15)
+                bus.send("LAS:LDI 0.0")
+                bus.pause(0.15)
+                bus.send("LAS:OUTPUT 1")
+                bus.pause(0.2)
+                bus.verify("LAS:OUT?", 1, "LAS ON acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "ON")
-                self.ctl.safe_pause(2.5)  # Mandatory safety lock delay
+                bus.pause(2.5)  # Mandatory safety lock delay
 
-                has_hw_err, hw_err_str = self.ctl.check_controller_errors(ch_num)
+                has_hw_err, hw_err_str = bus.check_errors()
                 if has_hw_err:
                     raise RuntimeError(hw_err_str)
 
-                self.ramp_current(i_on_target, i_ramp, idx)
+                self.ramp_current(bus, i_on_target, i_ramp)
 
         elif tec_curr_status == 1 and las_curr_status == 0:
             if tec_on_off == "ON" and las_on_off == "ON":
-                self.ramp_temp(t_on_target, t_ramp, idx)
-                self.ctl.safe_pause(0.15)
+                self.ramp_temp(bus, t_on_target, t_ramp)
+                bus.pause(0.15)
 
-                self.ctl.send_cmd("LAS:LDI 0.0")
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("LAS:OUTPUT 1")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("LAS:OUT?", 1, "LAS ON acknowledge failed.")
+                bus.send("LAS:LDI 0.0")
+                bus.pause(0.15)
+                bus.send("LAS:OUTPUT 1")
+                bus.pause(0.2)
+                bus.verify("LAS:OUT?", 1, "LAS ON acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "ON")
-                self.ctl.safe_pause(0.5)
+                bus.pause(0.5)
 
-                has_hw_err, hw_err_str = self.ctl.check_controller_errors(ch_num)
+                has_hw_err, hw_err_str = bus.check_errors()
                 if has_hw_err:
                     raise RuntimeError(hw_err_str)
 
-                self.ramp_current(i_on_target, i_ramp, idx)
+                self.ramp_current(bus, i_on_target, i_ramp)
 
             elif tec_on_off == "OFF" and las_on_off == "OFF":
-                self.ramp_temp(t_off_target, t_ramp, idx)
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("TEC:OUTPUT 0")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
+                self.ramp_temp(bus, t_off_target, t_ramp)
+                bus.pause(0.15)
+                bus.send("TEC:OUTPUT 0")
+                bus.pause(0.2)
+                bus.verify("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "OFF")
-                self.ctl.safe_pause(0.5)
+                bus.pause(0.5)
 
             elif tec_on_off == "ON" and las_on_off == "OFF":
-                self.ramp_temp(t_on_target, t_ramp, idx)
+                self.ramp_temp(bus, t_on_target, t_ramp)
 
         elif tec_curr_status == 1 and las_curr_status == 1:
             if tec_on_off == "ON" and las_on_off == "OFF":
-                self.ramp_current(0.0, i_ramp, idx)
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("LAS:OUTPUT 0")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+                self.ramp_current(bus, 0.0, i_ramp)
+                bus.pause(0.15)
+                bus.send("LAS:OUTPUT 0")
+                bus.pause(0.2)
+                bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "OFF")
-                self.ctl.safe_pause(0.5)
-                self.ramp_temp(t_on_target, t_ramp, idx)
+                bus.pause(0.5)
+                self.ramp_temp(bus, t_on_target, t_ramp)
 
             elif tec_on_off == "OFF" and las_on_off == "OFF":
-                self.ramp_current(0.0, i_ramp, idx)
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("LAS:OUTPUT 0")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
+                self.ramp_current(bus, 0.0, i_ramp)
+                bus.pause(0.15)
+                bus.send("LAS:OUTPUT 0")
+                bus.pause(0.2)
+                bus.verify("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
                 self.events.on_live_output(idx, "LAS", "OFF")
-                self.ctl.safe_pause(1.0)
-                self.ramp_temp(t_off_target, t_ramp, idx)
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("TEC:OUTPUT 0")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
+                bus.pause(1.0)
+                self.ramp_temp(bus, t_off_target, t_ramp)
+                bus.pause(0.15)
+                bus.send("TEC:OUTPUT 0")
+                bus.pause(0.2)
+                bus.verify("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
                 self.events.on_live_output(idx, "TEC", "OFF")
-                self.ctl.safe_pause(0.5)
+                bus.pause(0.5)
 
             elif tec_on_off == "ON" and las_on_off == "ON":
-                self.ramp_temp(t_on_target, t_ramp, idx)
-                self.ctl.safe_pause(0.15)
-                self.ramp_current(i_on_target, i_ramp, idx)
+                self.ramp_temp(bus, t_on_target, t_ramp)
+                bus.pause(0.15)
+                self.ramp_current(bus, i_on_target, i_ramp)
         else:
             if tec_curr_status == 0 and las_curr_status == 1:
-                self.events.on_status(idx, "CRITICAL: Laser ON without TEC. Ramping down safely.", C_FAULT)
-                self.ramp_current(0.0, i_ramp, idx)
-                self.ctl.safe_pause(0.15)
-                self.ctl.send_cmd("LAS:OUTPUT 0")
-                self.ctl.safe_pause(0.2)
-                self.ctl.verify_hw_state("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
-                self.events.on_live_output(idx, "LAS", "OFF")
-                raise RuntimeError(f"CRITICAL FAULT CH {ch_num}: Laser ON while TEC OFF. Ramped down laser safely.")
+                self._critical_laser_without_tec(bus, i_ramp)
             else:
-                # Reached only when TEC/LAS output status could not be determined
-                # (a query returned -1 / unparseable, or a value outside {0,1}).
-                # Fail loud rather than silently skipping the channel: for laser
-                # safety we must not proceed with an unknown output state.
+                # Reached only when TEC/LAS output status could not be determined.
+                # Fail loud rather than silently skipping: for laser safety we must
+                # not proceed with an unknown output state.
                 raise RuntimeError(
                     f"Could not read TEC/LAS output state for Ch {ch_num} "
                     f"(TEC={tec_curr_status}, LAS={las_curr_status}). Aborting for safety.")
 
         if not self.ctl.is_stop_requested:
-            self.final_check(ch_num)
+            self.final_check(bus)
 
-    def tec_temp_tset_tcurr(self):
-        t_curr_str = self.ctl.query_cmd("TEC:T?")
+    def tec_temp_tset_tcurr(self, bus):
+        t_curr_str = bus.query("TEC:T?")
         try:
             t_curr = float(t_curr_str)
             if not math.isnan(t_curr):
-                self.ctl.cmd_pause(f"TEC:T {t_curr:.2f}")
+                bus.cmd_pause(f"TEC:T {t_curr:.2f}")
         except Exception:
             pass
 
     # ----------------------------------------------------
     # RAMPS
     # ----------------------------------------------------
-    def ramp_temp(self, t_target, t_ramp, idx):
+    def ramp_temp(self, bus, t_target, t_ramp):
+        idx = bus.idx
         t_curr = None
-        for retry in range(5):
-            t_curr_str = self.ctl.query_cmd("TEC:SYNCT?")
+        for _ in range(5):
+            t_curr_str = bus.query("TEC:SYNCT?")
             try:
                 t_curr = float(t_curr_str)
                 break
             except Exception:
-                self.ctl.safe_pause(0.15)
+                bus.pause(0.15)
 
         if t_curr is None or math.isnan(t_curr):
             raise RuntimeError("Telemetry lost during initial Thermal readout.")
@@ -342,14 +624,9 @@ class Sequencer:
         t_set = t_curr
         t_start = t_curr
         # Time-based stepping: advance the setpoint by (rate * actual elapsed time)
-        # each iteration instead of a fixed 0.5 s-worth of movement. The old code
-        # added abs(t_ramp)*0.5 per loop while assuming every loop took exactly
-        # 0.5 s, but each iteration also spends ~0.2-0.3 s inside query_cmd, so the
-        # true ramp ran ~30% slower than the requested °C/s (and the ETA was
-        # correspondingly optimistic). Measuring real elapsed time makes the
-        # physical ramp rate — and the ETA — match the setting.
+        # each iteration so the physical ramp rate matches the requested °C/s.
         direction = 1 if t_target > t_curr else -1
-        NOMINAL_PERIOD = 0.5  # priming value so the first step isn't zero-length
+        NOMINAL_PERIOD = 0.5
         last_tick = time.time() - NOMINAL_PERIOD
 
         t_fail_count = 0
@@ -360,23 +637,20 @@ class Sequencer:
             now = time.time()
             dt = now - last_tick
             last_tick = now
-            # Clamp dt so a stalled serial read (up to the port timeout) can't make
-            # the setpoint jump by a large, unsafe increment in a single step.
-            dt = max(0.0, min(dt, 1.0))
+            dt = max(0.0, min(dt, 1.0))  # clamp so a stalled read can't leap the setpoint
 
             t_set += direction * abs(t_ramp) * dt
             if (direction > 0 and t_set > t_target) or (direction < 0 and t_set < t_target):
                 t_set = t_target
 
-            self.ctl.send_cmd(f"TEC:T {t_set:.2f}")
+            bus.send(f"TEC:T {t_set:.2f}")
 
-            # Safe high-responsiveness loop pause (total 0.5s)
             p_start = time.time()
             while time.time() - p_start < 0.5:
                 self.events.on_tick()
-                self.ctl.safe_pause(0.1)
+                bus.pause(0.1)
 
-            t_curr_str = self.ctl.query_cmd("TEC:SYNCT?")
+            t_curr_str = bus.query("TEC:SYNCT?")
             try:
                 t_curr = float(t_curr_str)
                 if math.isnan(t_curr):
@@ -388,25 +662,23 @@ class Sequencer:
                     raise RuntimeError("Hardware communication lost during ramp. Stopping execution.")
                 t_curr = t_set
 
-            # Update entry box readout
             self.events.on_live_value(idx, "T", t_curr)
 
-            # Draw progress bar text in status field
             pct = min(1.0, max(0.0, abs(t_curr - t_start) / max(0.01, abs(t_target - t_start))))
             num_blocks = round(pct * 10)
             prog_bar = '█' * num_blocks + '░' * (10 - num_blocks)
-
             self.events.on_status(idx, f"[{prog_bar}] ({t_curr:.1f} °C)", C_RAMP_T)
 
-    def ramp_current(self, i_target, i_ramp, idx):
+    def ramp_current(self, bus, i_target, i_ramp):
+        idx = bus.idx
         i_curr = None
-        for retry in range(5):
-            i_curr_str = self.ctl.query_cmd("LAS:SYNCLDI?")
+        for _ in range(5):
+            i_curr_str = bus.query("LAS:SYNCLDI?")
             try:
                 i_curr = float(i_curr_str)
                 break
             except Exception:
-                self.ctl.safe_pause(0.15)
+                bus.pause(0.15)
 
         if i_curr is None or math.isnan(i_curr):
             raise RuntimeError("Telemetry lost during initial Laser readout.")
@@ -417,11 +689,8 @@ class Sequencer:
 
         i_set = i_curr
         i_start = i_curr
-        # Time-based stepping (see ramp_temp for the full rationale): advance the
-        # current setpoint by (rate * actual elapsed time) so the physical mA/s
-        # ramp rate and the ETA match the requested value instead of running slow.
         direction = 1 if i_target > i_curr else -1
-        NOMINAL_PERIOD = 0.5  # priming value so the first step isn't zero-length
+        NOMINAL_PERIOD = 0.5
         last_tick = time.time() - NOMINAL_PERIOD
 
         i_fail_count = 0
@@ -432,22 +701,20 @@ class Sequencer:
             now = time.time()
             dt = now - last_tick
             last_tick = now
-            # Clamp dt so a stalled serial read (up to the port timeout) can't make
-            # the setpoint jump by a large, unsafe increment in a single step.
             dt = max(0.0, min(dt, 1.0))
 
             i_set += direction * abs(i_ramp) * dt
             if (direction > 0 and i_set > i_target) or (direction < 0 and i_set < i_target):
                 i_set = i_target
 
-            self.ctl.send_cmd(f"LAS:LDI {i_set:.2f}")
+            bus.send(f"LAS:LDI {i_set:.2f}")
 
             p_start = time.time()
             while time.time() - p_start < 0.5:
                 self.events.on_tick()
-                self.ctl.safe_pause(0.1)
+                bus.pause(0.1)
 
-            i_curr_str = self.ctl.query_cmd("LAS:SYNCLDI?")
+            i_curr_str = bus.query("LAS:SYNCLDI?")
             try:
                 i_curr = float(i_curr_str)
                 if math.isnan(i_curr):
@@ -461,23 +728,19 @@ class Sequencer:
 
             self.events.on_live_value(idx, "I", i_curr)
 
-            # Draw progress bar text in status field
             pct = min(1.0, max(0.0, abs(i_curr - i_start) / max(0.01, abs(i_target - i_start))))
             num_blocks = round(pct * 10)
             prog_bar = '█' * num_blocks + '░' * (10 - num_blocks)
-
             self.events.on_status(idx, f"[{prog_bar}] ({i_curr:.1f} mA)", C_RAMP_I)
 
-    def final_check(self, ch_num):
-        idx = ch_num - 1
-
+    def final_check(self, bus):
+        idx = bus.idx
         try:
-            tec_stat = int(float(self.ctl.query_cmd("TEC:OUT?")))
+            tec_stat = int(float(bus.query("TEC:OUT?")))
         except Exception:
             tec_stat = -1
-
         try:
-            las_stat = int(float(self.ctl.query_cmd("LAS:OUT?")))
+            las_stat = int(float(bus.query("LAS:OUT?")))
         except Exception:
             las_stat = -1
 
@@ -499,4 +762,4 @@ class Sequencer:
         self.events.on_status(idx, status_str, C_OK)
         self.events.on_led(idx, LED_OK)
 
-        self.ctl.cmd_pause("LAS:MOD 1")
+        bus.cmd_pause("LAS:MOD 1")

@@ -96,7 +96,10 @@ For each enabled channel, you can configure target parameters:
 1. Select the desired **Target TEC** status (`ON`/`OFF`) and **Target LAS** status (`ON`/`OFF`).
 2. Input the **Target T (°C)** and **Target I (mA)**.
 3. To run a single channel, click the **▶ Run Ch.** button next to that channel.
-4. To run all enabled channels sequentially, click the green **▶ RUN ALL** button.
+4. To run all enabled channels, pick a **Ramp mode** (each option shows a live time estimate) and click the green **▶ RUN ALL** button:
+   * **Per-channel** — finish each laser's temperature→current sequence before starting the next. *(Default.)*
+   * **By stage** — ramp every channel's temperature first, then every channel's current. Auto-ordered (current-down → temperature → current-up) so the TEC-before-LAS interlock holds for both start-up and shutdown; useful for synchronizing a multi-laser experiment.
+   * **Parallel** — ramp all channels at once (fastest). Every channel still runs the full per-channel safety sequence in its own thread. *Validate on your hardware before relying on it.*
 5. If you need to stop, click the red **⏹ CANCEL RUN (Safe)** button. The software will immediately halt sweeps and hold current values stable at their last safe increments.
 
 ---
