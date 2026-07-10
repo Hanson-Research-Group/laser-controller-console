@@ -18,6 +18,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox
 
 from laser_controller import LaserController
+from sequencer import Sequencer, SequenceEvents, ChannelPlan
 
 import ctypes
 try:
@@ -67,6 +68,39 @@ class LEDIndicator(tk.Canvas):
         self.draw_circle()
 
 
+class _TkSequenceEvents(SequenceEvents):
+    """Bridges the UI-agnostic Sequencer to the Tk GUI. The sequencer runs on a
+    worker thread, so every callback is marshalled onto the Tk main thread via
+    app.after(...) — the same pattern the ramp code used inline before extraction."""
+
+    def __init__(self, app):
+        self.app = app
+
+    def on_status(self, idx, text, color):
+        self.app.after(0, self.app.update_channel_status, idx, text, color)
+
+    def on_led(self, idx, color):
+        self.app.after(0, self.app.ch_ui[idx]["led"].set_color, color)
+
+    def on_live_output(self, idx, kind, state):
+        self.app.after(0, self.app.update_live_out_ui, idx, kind, state)
+
+    def on_live_value(self, idx, kind, value):
+        widget = self.app.ch_ui[idx]["cur_t" if kind == "T" else "cur_i"]
+        self.app.after(0, set_entry_val, widget, f"{value:.1f}")
+
+    def on_tick(self):
+        # update_eta() itself schedules the label update via after(), so it is
+        # safe to call directly from the worker thread.
+        self.app.update_eta()
+
+    def on_channel_halted(self, idx):
+        self.app.after(0, self.app._handle_channel_halted, idx)
+
+    def on_channel_fault(self, idx, message):
+        self.app.after(0, self.app._handle_channel_fault, idx, message)
+
+
 class LDCControllerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -94,6 +128,12 @@ class LDCControllerApp(ctk.CTk):
         # in the UI-agnostic LaserController (laser_controller.py). The GUI accesses
         # them through the proxy properties / delegator methods defined below.
         self.ctl = LaserController(num_channels=self.num_channels)
+
+        # Ramp / sequence engine (also UI-agnostic). It drives self.ctl and reports
+        # back through the Tk event adapter, which marshals every update onto the
+        # main thread — replacing the old direct self.after(...) calls scattered
+        # through the ramp code.
+        self.seq = Sequencer(self.ctl, events=_TkSequenceEvents(self))
 
         # --- Application (UI) State Variables ---
         self.is_executing = False
@@ -1251,6 +1291,12 @@ class LDCControllerApp(ctk.CTk):
             messagebox.showerror("Invalid Configuration", "Ramp speeds must be strictly greater than 0 to prevent hardware damage and infinite loops.")
             return
 
+        # Build the channel plans and ETA on the MAIN thread. All widget reads must
+        # happen here — the worker thread (and the sequence engine) must never touch
+        # Tk widgets. The engine reports back only through the _TkSequenceEvents
+        # adapter, which marshals every update via after().
+        plans, total_est = self._build_sequence(channels_to_run, t_ramp, i_ramp, t_off_target)
+
         # Prepare state variables
         self.is_executing = True
         self.is_stop_requested = False
@@ -1262,136 +1308,87 @@ class LDCControllerApp(ctk.CTk):
         self.btn_emerg.configure(state="normal")
 
         # Start sequence thread
-        threading.Thread(target=self.run_sequence_thread, 
-                         args=(channels_to_run, t_ramp, i_ramp, t_off_target), 
+        threading.Thread(target=self.run_sequence_thread,
+                         args=(plans, t_ramp, i_ramp, t_off_target, total_est),
                          daemon=True).start()
 
-    def run_sequence_thread(self, channels_to_run, t_ramp, i_ramp, t_off_target):
-        # 1. Pre-calculate global estimated time of arrival (ETA) matching MATLAB
-        self.total_estimated_time = 0.0
-        
+    def _build_sequence(self, channels_to_run, t_ramp, i_ramp, t_off_target):
+        """Read the per-channel widgets (MAIN THREAD ONLY) and produce the channel
+        plans plus the estimated total run time (ETA). Kept off the worker thread so
+        the sequence engine never touches Tk widgets."""
         TEC_ON_TIME = 1.0
         LAS_ON_TIME = 4.0
         LAS_OFF_TIME = 1.5
         TEC_OFF_TIME = 1.0
 
+        total_est = 0.0
+        plans = []
         for ch_num in channels_to_run:
             ch = self.ch_ui[ch_num - 1]
-            try:
-                curr_t = float(ch["cur_t"].get())
-                curr_i = float(ch["cur_i"].get())
-                t_targ = float(ch["t_target"].get())
-                i_targ = float(ch["i_target"].get())
-            except:
-                curr_t, curr_i, t_targ, i_targ = 22.0, 0.0, 22.0, 0.0
 
             t_cmd = ch["tec_cmd"].get()
             l_cmd = ch["las_cmd"].get()
             live_t = ch["live_tec"].get()
             live_l = ch["live_las"].get()
 
+            # Targets are user input and decide whether the channel can run.
+            try:
+                t_targ = float(ch["t_target"].get())
+                i_targ = float(ch["i_target"].get())
+                targets_valid = True
+            except ValueError:
+                t_targ, i_targ, targets_valid = 0.0, 0.0, False
+
+            # ETA snapshot (matches MATLAB: any unparseable field -> all defaults).
+            try:
+                curr_t = float(ch["cur_t"].get())
+                curr_i = float(ch["cur_i"].get())
+                eta_t = float(ch["t_target"].get())
+                eta_i = float(ch["i_target"].get())
+            except ValueError:
+                curr_t, curr_i, eta_t, eta_i = 22.0, 0.0, 22.0, 0.0
+
             if live_t == "OFF" and live_l == "OFF":
                 if t_cmd == "ON" and l_cmd == "OFF":
-                    self.total_estimated_time += TEC_ON_TIME + abs(t_targ - curr_t) / t_ramp
+                    total_est += TEC_ON_TIME + abs(eta_t - curr_t) / t_ramp
                 elif t_cmd == "ON" and l_cmd == "ON":
-                    self.total_estimated_time += TEC_ON_TIME + abs(t_targ - curr_t) / t_ramp
-                    self.total_estimated_time += LAS_ON_TIME + abs(i_targ - 0.0) / i_ramp
+                    total_est += TEC_ON_TIME + abs(eta_t - curr_t) / t_ramp
+                    total_est += LAS_ON_TIME + abs(eta_i - 0.0) / i_ramp
             elif live_t == "ON" and live_l == "OFF":
                 if t_cmd == "ON" and l_cmd == "ON":
-                    self.total_estimated_time += abs(t_targ - curr_t) / t_ramp
-                    self.total_estimated_time += LAS_ON_TIME + abs(i_targ - 0.0) / i_ramp
+                    total_est += abs(eta_t - curr_t) / t_ramp
+                    total_est += LAS_ON_TIME + abs(eta_i - 0.0) / i_ramp
                 elif t_cmd == "OFF" and l_cmd == "OFF":
-                    self.total_estimated_time += abs(t_off_target - curr_t) / t_ramp + TEC_OFF_TIME
+                    total_est += abs(t_off_target - curr_t) / t_ramp + TEC_OFF_TIME
                 elif t_cmd == "ON" and l_cmd == "OFF":
-                    self.total_estimated_time += abs(t_targ - curr_t) / t_ramp
+                    total_est += abs(eta_t - curr_t) / t_ramp
             elif live_t == "ON" and live_l == "ON":
                 if t_cmd == "ON" and l_cmd == "OFF":
-                    self.total_estimated_time += abs(0.0 - curr_i) / i_ramp + LAS_OFF_TIME
-                    self.total_estimated_time += abs(t_targ - curr_t) / t_ramp
+                    total_est += abs(0.0 - curr_i) / i_ramp + LAS_OFF_TIME
+                    total_est += abs(eta_t - curr_t) / t_ramp
                 elif t_cmd == "OFF" and l_cmd == "OFF":
-                    self.total_estimated_time += abs(0.0 - curr_i) / i_ramp + LAS_OFF_TIME
-                    self.total_estimated_time += abs(t_off_target - curr_t) / t_ramp + TEC_OFF_TIME
+                    total_est += abs(0.0 - curr_i) / i_ramp + LAS_OFF_TIME
+                    total_est += abs(t_off_target - curr_t) / t_ramp + TEC_OFF_TIME
                 elif t_cmd == "ON" and l_cmd == "ON":
-                    self.total_estimated_time += abs(t_targ - curr_t) / t_ramp
-                    self.total_estimated_time += abs(i_targ - curr_i) / i_ramp
+                    total_est += abs(eta_t - curr_t) / t_ramp
+                    total_est += abs(eta_i - curr_i) / i_ramp
 
+            plans.append(ChannelPlan(
+                idx=ch_num - 1, ch_num=ch_num,
+                tec_cmd=t_cmd, las_cmd=l_cmd,
+                t_target=t_targ, i_target=i_targ,
+                targets_valid=targets_valid))
+
+        return plans, total_est
+
+    def run_sequence_thread(self, plans, t_ramp, i_ramp, t_off_target, total_estimated_time):
+        # Plans and ETA were prepared on the main thread (see _build_sequence).
+        # This worker only drives the UI-agnostic sequence engine, which does all
+        # hardware I/O, the safety state machine, and the ramps.
+        self.total_estimated_time = total_estimated_time
         self.sequence_start_time = time.time()
 
-        # 2. Iterate channels and run ramps
-        for ch_num in channels_to_run:
-            if self.is_stop_requested:
-                break
-
-            ch = self.ch_ui[ch_num - 1]
-            tec_on_off = ch["tec_cmd"].get()
-            las_on_off = ch["las_cmd"].get()
-
-            try:
-                t_on_target = float(ch["t_target"].get())
-                i_on_target = float(ch["i_target"].get())
-            except ValueError:
-                self.after(0, self.update_channel_status, ch_num - 1, "Invalid targets", "#c62828")
-                continue
-
-            try:
-                # Lock serial during execution steps
-                with self.serial_lock:
-                    self.send_cmd(f"CHAN {ch_num}")
-                    time.sleep(0.1)
-                    
-                    # Read hardware limits from controller
-                    h_i_lim_str = self.query_cmd("LAS:LIM:I?")
-                    try:
-                        h_i_lim = float(h_i_lim_str)
-                    except:
-                        h_i_lim = 500.0
-
-                    h_t_lim_str = self.query_cmd("TEC:LIM:THI?")
-                    try:
-                        h_t_lim = float(h_t_lim_str)
-                    except:
-                        h_t_lim = 80.0
-
-                    # Safety Validation Checks
-                    if tec_on_off == "ON" and not math.isnan(h_t_lim) and t_on_target > h_t_lim:
-                        raise ValueError(f"Target T ({t_on_target:.1f}°C) exceeds limit ({h_t_lim:.1f}°C)")
-                    
-                    if las_on_off == "ON" and not math.isnan(h_i_lim) and i_on_target > h_i_lim:
-                        raise ValueError(f"Target I ({i_on_target:.1f}mA) exceeds limit ({h_i_lim:.1f}mA)")
-
-                    if tec_on_off == "OFF" and las_on_off == "ON":
-                        raise ValueError("TEC must be ON for LAS to be ON.")
-
-                    # Core execution logic
-                    self.run_control_core(ch_num, tec_on_off, t_on_target, t_off_target, las_on_off, i_on_target, t_ramp, i_ramp)
-
-                    # Final check for silent hardware error
-                    has_err, err_str = self.check_controller_errors_threadsafe(ch_num)
-                    if has_err:
-                        raise RuntimeError(err_str)
-
-            except Exception as e:
-                # Handle sequence halt/error
-                err_msg = str(e)
-                if "HALT" in err_msg:
-                    status_text = ch["status"].cget("text")
-                    if status_text == "Initializing...":
-                        self.after(0, self.update_channel_status, ch_num - 1, "HALTED (Before Ramp)", "#c62828")
-                    else:
-                        self.after(0, self.update_channel_status, ch_num - 1,
-                                   f"HALTED at {ch['cur_t'].get()}°C, {ch['cur_i'].get()}mA", "#c62828")
-                else:
-                    # P2 #10: Show full error message — truncation hid critical fault info
-                    self.after(0, self.update_channel_status, ch_num - 1, err_msg, "#c62828")
-                    self.after(0, ch["led"].set_color, "#ff0000")
-                    print(f"[Hardware Fault] Channel {ch_num}: {err_msg}")
-
-                self.is_stop_requested = True
-                # P3 #9: Triple bell matches MATLAB triple-beep for hardware fault alert
-                self.bell()
-                self.after(150, self.bell)
-                self.after(300, self.bell)
-                break
+        self.seq.run(plans, t_ramp, i_ramp, t_off_target)
 
         # Finished Phase Cleanup
         self.is_executing = False
@@ -1408,361 +1405,36 @@ class LDCControllerApp(ctk.CTk):
             self.after(0, lambda: self.status_label.configure(text="Status: Hardware Halted & Pinned.", text_color="#c62828"))
         else:
             self.after(0, lambda: self.status_label.configure(text="Status: Sequence Complete & Settled.", text_color="#2e7d32"))
-            if len(channels_to_run) > 1:
+            if len(plans) > 1:
                 self.bell()
                 self.after(0, lambda: messagebox.showinfo("Done", "Sequence completed across all selected channels."))
 
         # Trigger telemetry immediately to synchronize button state
         self.run_telemetry_cycle()
 
-    def run_control_core(self, ch_num, tec_on_off, t_on_target, t_off_target, las_on_off, i_on_target, t_ramp, i_ramp):
-        idx = ch_num - 1
+    # --- Sequence event handlers (invoked on the Tk thread via _TkSequenceEvents) ---
+    def _handle_channel_halted(self, idx):
+        """UI response to a cooperative STOP / EMO halt on channel idx."""
         ch = self.ch_ui[idx]
-        
-        self.after(0, self.update_channel_status, idx, "Initializing...", "#222222")
-        self.after(0, ch["led"].set_color, "#ffdd00")
-
-        # 1. Command Verification Alignment
-        chan_curr = -1
-        for retry in range(3):
-            try:
-                chan_curr = int(self.query_cmd("CHAN?"))
-                if chan_curr == ch_num:
-                    break
-            except:
-                pass
-            self.safe_pause(0.15)
-            self.cmd_pause(f"CHAN {ch_num}")
-
-        if chan_curr != ch_num:
-            raise RuntimeError(f"Ch. switch to {ch_num} timed out or failed.")
-
-        self.cmd_pause("LAS:MOD 0")
-        self.safe_pause(0.1)
-        self.verify_hw_state("LAS:MOD?", 0, "Hardware failed to disable external modulation.")
-
-        # 2. Read Current Status
-        try:
-            tec_curr_status = int(float(self.query_cmd("TEC:OUT?")))
-        except:
-            tec_curr_status = -1
-
-        try:
-            las_curr_status = int(float(self.query_cmd("LAS:OUT?")))
-        except:
-            las_curr_status = -1
-
-        # Safety Routing State Machine Matching MATLAB
-        if tec_curr_status == 0 and las_curr_status == 0:
-            if tec_on_off == "ON" and las_on_off == "OFF":
-                self.tec_temp_tset_tcurr()
-                self.safe_pause(0.15)
-                self.send_cmd("TEC:OUTPUT 1")
-                self.safe_pause(0.2)
-                self.verify_hw_state("TEC:OUT?", 1, "TEC ON acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "TEC", "ON")
-                self.safe_pause(0.15)
-                self.ramp_temp(t_on_target, t_ramp, idx)
-
-            elif tec_on_off == "ON" and las_on_off == "ON":
-                self.tec_temp_tset_tcurr()
-                self.safe_pause(0.15)
-                self.send_cmd("TEC:OUTPUT 1")
-                self.safe_pause(0.2)
-                self.verify_hw_state("TEC:OUT?", 1, "TEC ON acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "TEC", "ON")
-                self.safe_pause(0.15)
-                self.ramp_temp(t_on_target, t_ramp, idx)
-
-                self.safe_pause(0.15)
-                self.send_cmd("LAS:LDI 0.0")
-                self.safe_pause(0.15)
-                self.send_cmd("LAS:OUTPUT 1")
-                self.safe_pause(0.2)
-                self.verify_hw_state("LAS:OUT?", 1, "LAS ON acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "LAS", "ON")
-                self.safe_pause(2.5)  # Mandatory safety lock delay
-                
-                has_hw_err, hw_err_str = self.check_controller_errors_threadsafe(ch_num)
-                if has_hw_err:
-                    raise RuntimeError(hw_err_str)
-
-                self.ramp_current(i_on_target, i_ramp, idx)
-
-        elif tec_curr_status == 1 and las_curr_status == 0:
-            if tec_on_off == "ON" and las_on_off == "ON":
-                self.ramp_temp(t_on_target, t_ramp, idx)
-                self.safe_pause(0.15)
-
-                self.send_cmd("LAS:LDI 0.0")
-                self.safe_pause(0.15)
-                self.send_cmd("LAS:OUTPUT 1")
-                self.safe_pause(0.2)
-                self.verify_hw_state("LAS:OUT?", 1, "LAS ON acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "LAS", "ON")
-                self.safe_pause(0.5)
-                
-                has_hw_err, hw_err_str = self.check_controller_errors_threadsafe(ch_num)
-                if has_hw_err:
-                    raise RuntimeError(hw_err_str)
-
-                self.ramp_current(i_on_target, i_ramp, idx)
-
-            elif tec_on_off == "OFF" and las_on_off == "OFF":
-                self.ramp_temp(t_off_target, t_ramp, idx)
-                self.safe_pause(0.15)
-                self.send_cmd("TEC:OUTPUT 0")
-                self.safe_pause(0.2)
-                self.verify_hw_state("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "TEC", "OFF")
-                self.safe_pause(0.5)
-
-            elif tec_on_off == "ON" and las_on_off == "OFF":
-                self.ramp_temp(t_on_target, t_ramp, idx)
-
-        elif tec_curr_status == 1 and las_curr_status == 1:
-            if tec_on_off == "ON" and las_on_off == "OFF":
-                self.ramp_current(0.0, i_ramp, idx)
-                self.safe_pause(0.15)
-                self.send_cmd("LAS:OUTPUT 0")
-                self.safe_pause(0.2)
-                self.verify_hw_state("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
-                self.safe_pause(0.5)
-                self.ramp_temp(t_on_target, t_ramp, idx)
-
-            elif tec_on_off == "OFF" and las_on_off == "OFF":
-                self.ramp_current(0.0, i_ramp, idx)
-                self.safe_pause(0.15)
-                self.send_cmd("LAS:OUTPUT 0")
-                self.safe_pause(0.2)
-                self.verify_hw_state("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
-                self.safe_pause(1.0)
-                self.ramp_temp(t_off_target, t_ramp, idx)
-                self.safe_pause(0.15)
-                self.send_cmd("TEC:OUTPUT 0")
-                self.safe_pause(0.2)
-                self.verify_hw_state("TEC:OUT?", 0, "TEC OFF acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "TEC", "OFF")
-                self.safe_pause(0.5)
-
-            elif tec_on_off == "ON" and las_on_off == "ON":
-                self.ramp_temp(t_on_target, t_ramp, idx)
-                self.safe_pause(0.15)
-                self.ramp_current(i_on_target, i_ramp, idx)
+        if ch["status"].cget("text") == "Initializing...":
+            self.update_channel_status(idx, "HALTED (Before Ramp)", "#c62828")
         else:
-            if tec_curr_status == 0 and las_curr_status == 1:
-                self.after(0, self.update_channel_status, idx, "CRITICAL: Laser ON without TEC. Ramping down safely.", "#c62828")
-                self.ramp_current(0.0, i_ramp, idx)
-                self.safe_pause(0.15)
-                self.send_cmd("LAS:OUTPUT 0")
-                self.safe_pause(0.2)
-                self.verify_hw_state("LAS:OUT?", 0, "LAS OFF acknowledge failed.")
-                self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
-                raise RuntimeError(f"CRITICAL FAULT CH {ch_num}: Laser ON while TEC OFF. Ramped down laser safely.")
-            else:
-                # Reached only when TEC/LAS output status could not be determined
-                # (a query returned -1 / unparseable, or a value outside {0,1}).
-                # Fail loud rather than silently skipping the channel: for laser
-                # safety we must not proceed with an unknown output state.
-                raise RuntimeError(
-                    f"Could not read TEC/LAS output state for Ch {ch_num} "
-                    f"(TEC={tec_curr_status}, LAS={las_curr_status}). Aborting for safety.")
+            self.update_channel_status(
+                idx, f"HALTED at {ch['cur_t'].get()}°C, {ch['cur_i'].get()}mA", "#c62828")
+        self._triple_bell()
 
-        if not self.is_stop_requested:
-            self.final_check(ch_num)
+    def _handle_channel_fault(self, idx, message):
+        """UI response to a hardware / validation fault on channel idx."""
+        self.update_channel_status(idx, message, "#c62828")
+        self.ch_ui[idx]["led"].set_color("#ff0000")
+        print(f"[Hardware Fault] Channel {idx + 1}: {message}")
+        self._triple_bell()
 
-    def tec_temp_tset_tcurr(self):
-        t_curr_str = self.query_cmd("TEC:T?")
-        try:
-            t_curr = float(t_curr_str)
-            if not math.isnan(t_curr):
-                self.cmd_pause(f"TEC:T {t_curr:.2f}")
-        except:
-            pass
-
-    def ramp_temp(self, t_target, t_ramp, idx):
-        ch = self.ch_ui[idx]
-        t_curr = None
-        for retry in range(5):
-            t_curr_str = self.query_cmd("TEC:SYNCT?")
-            try:
-                t_curr = float(t_curr_str)
-                break
-            except:
-                self.safe_pause(0.15)
-
-        if t_curr is None or math.isnan(t_curr):
-            raise RuntimeError("Telemetry lost during initial Thermal readout.")
-
-        if abs(t_curr - t_target) < 0.05:
-            self.after(0, self.update_channel_status, idx, f"T at Target ({t_curr:.1f} °C)", "#2e7d32")
-            return
-
-        t_set = t_curr
-        t_start = t_curr
-        # Time-based stepping: advance the setpoint by (rate * actual elapsed time)
-        # each iteration instead of a fixed 0.5 s-worth of movement. The old code
-        # added abs(t_ramp)*0.5 per loop while assuming every loop took exactly
-        # 0.5 s, but each iteration also spends ~0.2-0.3 s inside query_cmd, so the
-        # true ramp ran ~30% slower than the requested °C/s (and update_eta was
-        # correspondingly optimistic). Measuring real elapsed time makes the
-        # physical ramp rate — and the ETA — match the setting.
-        direction = 1 if t_target > t_curr else -1
-        NOMINAL_PERIOD = 0.5  # priming value so the first step isn't zero-length
-        last_tick = time.time() - NOMINAL_PERIOD
-
-        t_fail_count = 0
-        while abs(t_set - t_target) > 0.01:
-            if self.is_stop_requested:
-                raise RuntimeError("HALT")
-
-            now = time.time()
-            dt = now - last_tick
-            last_tick = now
-            # Clamp dt so a stalled serial read (up to the port timeout) can't make
-            # the setpoint jump by a large, unsafe increment in a single step.
-            dt = max(0.0, min(dt, 1.0))
-
-            t_set += direction * abs(t_ramp) * dt
-            if (direction > 0 and t_set > t_target) or (direction < 0 and t_set < t_target):
-                t_set = t_target
-
-            self.send_cmd(f"TEC:T {t_set:.2f}")
-
-            # Safe high-responsiveness loop pause (total 0.5s)
-            p_start = time.time()
-            while time.time() - p_start < 0.5:
-                self.update_eta()
-                self.safe_pause(0.1)
-
-            t_curr_str = self.query_cmd("TEC:SYNCT?")
-            try:
-                t_curr = float(t_curr_str)
-                if math.isnan(t_curr):
-                    raise ValueError("NaN")
-                t_fail_count = 0
-            except:
-                t_fail_count += 1
-                if t_fail_count > 3:
-                    raise RuntimeError("Hardware communication lost during ramp. Stopping execution.")
-                t_curr = t_set
-
-            # Update entry box readout
-            self.after(0, set_entry_val, ch["cur_t"], f"{t_curr:.1f}")
-
-            # Draw progress bar text in status field
-            pct = min(1.0, max(0.0, abs(t_curr - t_start) / max(0.01, abs(t_target - t_start))))
-            num_blocks = round(pct * 10)
-            prog_bar = '█' * num_blocks + '░' * (10 - num_blocks)
-            
-            self.after(0, self.update_channel_status, idx, f"[{prog_bar}] ({t_curr:.1f} °C)", "#1565c0")
-
-    def ramp_current(self, i_target, i_ramp, idx):
-        ch = self.ch_ui[idx]
-        i_curr = None
-        for retry in range(5):
-            i_curr_str = self.query_cmd("LAS:SYNCLDI?")
-            try:
-                i_curr = float(i_curr_str)
-                break
-            except:
-                self.safe_pause(0.15)
-
-        if i_curr is None or math.isnan(i_curr):
-            raise RuntimeError("Telemetry lost during initial Laser readout.")
-
-        if abs(i_curr - i_target) < 0.05:
-            self.after(0, self.update_channel_status, idx, f"I at Target ({i_curr:.1f} mA)", "#2e7d32")
-            return
-
-        i_set = i_curr
-        i_start = i_curr
-        # Time-based stepping (see ramp_temp for the full rationale): advance the
-        # current setpoint by (rate * actual elapsed time) so the physical mA/s
-        # ramp rate and the ETA match the requested value instead of running slow.
-        direction = 1 if i_target > i_curr else -1
-        NOMINAL_PERIOD = 0.5  # priming value so the first step isn't zero-length
-        last_tick = time.time() - NOMINAL_PERIOD
-
-        i_fail_count = 0
-        while abs(i_set - i_target) > 0.01:
-            if self.is_stop_requested:
-                raise RuntimeError("HALT")
-
-            now = time.time()
-            dt = now - last_tick
-            last_tick = now
-            # Clamp dt so a stalled serial read (up to the port timeout) can't make
-            # the setpoint jump by a large, unsafe increment in a single step.
-            dt = max(0.0, min(dt, 1.0))
-
-            i_set += direction * abs(i_ramp) * dt
-            if (direction > 0 and i_set > i_target) or (direction < 0 and i_set < i_target):
-                i_set = i_target
-
-            self.send_cmd(f"LAS:LDI {i_set:.2f}")
-
-            p_start = time.time()
-            while time.time() - p_start < 0.5:
-                self.update_eta()
-                self.safe_pause(0.1)
-
-            i_curr_str = self.query_cmd("LAS:SYNCLDI?")
-            try:
-                i_curr = float(i_curr_str)
-                if math.isnan(i_curr):
-                    raise ValueError("NaN")
-                i_fail_count = 0
-            except:
-                i_fail_count += 1
-                if i_fail_count > 3:
-                    raise RuntimeError("Hardware communication lost during ramp. Stopping execution.")
-                i_curr = i_set
-
-            self.after(0, set_entry_val, ch["cur_i"], f"{i_curr:.1f}")
-
-            # Draw progress bar text in status field
-            pct = min(1.0, max(0.0, abs(i_curr - i_start) / max(0.01, abs(i_target - i_start))))
-            num_blocks = round(pct * 10)
-            prog_bar = '█' * num_blocks + '░' * (10 - num_blocks)
-            
-            self.after(0, self.update_channel_status, idx, f"[{prog_bar}] ({i_curr:.1f} mA)", "#7b1fa2")
-
-    def final_check(self, ch_num):
-        idx = ch_num - 1
-        ch = self.ch_ui[idx]
-        
-        try:
-            tec_stat = int(float(self.query_cmd("TEC:OUT?")))
-        except:
-            tec_stat = -1
-
-        try:
-            las_stat = int(float(self.query_cmd("LAS:OUT?")))
-        except:
-            las_stat = -1
-
-        status_str = "Final Set: "
-        if tec_stat == 1:
-            status_str += "TEC ON, "
-            self.after(0, self.update_live_out_ui, idx, "TEC", "ON")
-        else:
-            status_str += "TEC OFF, "
-            self.after(0, self.update_live_out_ui, idx, "TEC", "OFF")
-
-        if las_stat == 1:
-            status_str += "LAS ON"
-            self.after(0, self.update_live_out_ui, idx, "LAS", "ON")
-        else:
-            status_str += "LAS OFF"
-            self.after(0, self.update_live_out_ui, idx, "LAS", "OFF")
-
-        self.after(0, self.update_channel_status, idx, status_str, "#2e7d32")
-        self.after(0, ch["led"].set_color, "#2e7d32")
-
-        self.cmd_pause("LAS:MOD 1")
+    def _triple_bell(self):
+        # P3 #9: Triple bell matches MATLAB triple-beep for fault/halt alerts.
+        self.bell()
+        self.after(150, self.bell)
+        self.after(300, self.bell)
 
     # --- UI Dispatch Update Helpers ---
     def update_channel_status(self, idx, text, color):
