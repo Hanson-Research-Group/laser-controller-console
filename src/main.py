@@ -127,7 +127,9 @@ class LDCControllerApp(ctk.CTk):
         # --- Configure Main Window ---
         self.title("LDC-3908 Modular Laser Diode Controller Software v0.3.1")
         self.geometry("1850x950")
-        self.minsize(1650, 800)
+        # Low minimum so the app is usable on laptops and at half/quarter of a
+        # large display; the channel cards reflow to fewer columns as it shrinks.
+        self.minsize(900, 650)
         
         # Set window icon
         try:
@@ -295,189 +297,66 @@ class LDCControllerApp(ctk.CTk):
         self.status_label.grid(row=0, column=7, padx=(10, 20), pady=10, sticky="e")
 
         # ----------------------------------------------------
-        # 2. MIDDLE PANEL: CHANNELS GRID
+        # 2. MIDDLE PANEL: CHANNEL CARDS (responsive, reflowing)
         # ----------------------------------------------------
         chan_panel = ctk.CTkFrame(self)
         chan_panel.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        
-        # Configure layout grids inside channel panel
         chan_panel.grid_rowconfigure(1, weight=1)
         chan_panel.grid_columnconfigure(0, weight=1)
 
-        # Title Label
-        ctk.CTkLabel(chan_panel, text="Individual Channel Configuration & Live Telemetry", font=("Segoe UI", 16, "bold")).grid(row=0, column=0, padx=10, pady=5, sticky="w")
+        # --- Controls bar: title, show-unused switch, master overrides ---
+        bar = ctk.CTkFrame(chan_panel, fg_color="transparent")
+        bar.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 2))
+        bar.grid_columnconfigure(1, weight=1)
 
-        # Dynamic Grid Container
-        self.grid_container = ctk.CTkFrame(chan_panel, fg_color="transparent")
-        self.grid_container.grid(row=1, column=0, sticky="nsew", padx=10, pady=5)
-        
-        # Headers definitions
-        headers = [
-            ("Ch.", 48), ("Enable", 68), ("Label", 162), ("LED", 54), ("Status", 203),
-            ("Live TEC", 102), ("Live LAS", 102), ("Live T (°C)", 115), ("Live I (mA)", 115),
-            ("Target TEC", 115), ("Target LAS", 115), ("Target T (°C)", 115), ("Max T", 61),
-            ("Target I (mA)", 115), ("Max I", 61), ("Action", 122)
-        ]
-        
-        for col_idx, (header_text, min_width) in enumerate(headers):
-            self.grid_container.grid_columnconfigure(col_idx, weight=1, minsize=min_width)
-            lbl = ctk.CTkLabel(self.grid_container, text=header_text, font=("Segoe UI", 14, "bold"))
-            # Custom styling color for live readouts
-            if "Live" in header_text:
-                lbl.configure(text_color="#2e7d32")
-            lbl.grid(row=0, column=col_idx, padx=3, pady=5)
+        ctk.CTkLabel(bar, text="Channel Configuration & Live Telemetry",
+                     font=("Segoe UI", 16, "bold")).grid(row=0, column=0, sticky="w")
 
-        # Store UI elements per channel
+        right = ctk.CTkFrame(bar, fg_color="transparent")
+        right.grid(row=0, column=2, sticky="e")
+
+        self.show_unused_var = tk.BooleanVar(value=False)
+        self.chk_show_unused = ctk.CTkSwitch(right, text="Show unused", variable=self.show_unused_var,
+                                             command=lambda: self._reflow_cards(force=True))
+        self.chk_show_unused.pack(side="left", padx=(0, 14))
+
+        self.btn_master_on = ctk.CTkButton(right, text="All ON", width=78, font=("Segoe UI", 13, "bold"),
+                                           fg_color=theme.GREEN, hover_color=theme.GREEN_HOVER, text_color="white",
+                                           state="disabled", command=lambda: self.set_all_systems("ON"))
+        self.btn_master_on.pack(side="left", padx=3)
+        self.btn_master_off = ctk.CTkButton(right, text="All OFF", width=78, font=("Segoe UI", 13, "bold"),
+                                            fg_color=theme.RED, hover_color=theme.RED_HOVER, text_color="white",
+                                            state="disabled", command=lambda: self.set_all_systems("OFF"))
+        self.btn_master_off.pack(side="left", padx=3)
+        self.btn_tec_on = ctk.CTkButton(right, text="TEC On", width=72, font=("Segoe UI", 13),
+                                        state="disabled", command=lambda: self.set_all_dropdowns("TEC", "ON"))
+        self.btn_tec_on.pack(side="left", padx=3)
+        self.btn_tec_off = ctk.CTkButton(right, text="TEC Off", width=72, font=("Segoe UI", 13),
+                                         state="disabled", command=lambda: self.set_all_dropdowns("TEC", "OFF"))
+        self.btn_tec_off.pack(side="left", padx=3)
+        self.btn_las_on = ctk.CTkButton(right, text="LAS On", width=72, font=("Segoe UI", 13),
+                                        state="disabled", command=lambda: self.set_all_dropdowns("LAS", "ON"))
+        self.btn_las_on.pack(side="left", padx=3)
+        self.btn_las_off = ctk.CTkButton(right, text="LAS Off", width=72, font=("Segoe UI", 13),
+                                         state="disabled", command=lambda: self.set_all_dropdowns("LAS", "OFF"))
+        self.btn_las_off.pack(side="left", padx=3)
+
+        # --- Scrollable, reflowing card container ---
+        self.cards_container = ctk.CTkScrollableFrame(chan_panel, fg_color="transparent")
+        self.cards_container.grid(row=1, column=0, sticky="nsew", padx=6, pady=4)
+
+        # Per-channel state used by the visibility filter.
+        self._has_scanned = False
+        self.ch_populated = [False] * self.num_channels
+        self._reflow_key = None
+
         self.ch_ui = []
-        
         for i in range(self.num_channels):
-            ch_idx = i + 1
-            row = ch_idx
+            self.ch_ui.append(self._build_channel_card(i))
 
-            self.grid_container.grid_rowconfigure(row, weight=1)
-
-            # Ch. number
-            lbl_ch = ctk.CTkLabel(self.grid_container, text=str(ch_idx), font=("Segoe UI", 14, "bold"))
-            lbl_ch.grid(row=row, column=0, padx=3, pady=3)
-
-            # Enable checkbox
-            var_enable = tk.BooleanVar(value=False)
-            chk_enable = ctk.CTkCheckBox(self.grid_container, text="", variable=var_enable, width=27, state="disabled")
-            chk_enable.grid(row=row, column=1, padx=3, pady=3)
-
-            # Label field
-            ent_label = ctk.CTkEntry(self.grid_container, placeholder_text=f"Laser {ch_idx}", width=149, state="disabled")
-            ent_label.insert(0, f"Laser {ch_idx}")
-            ent_label.grid(row=row, column=2, padx=3, pady=3, sticky="ew")
-            ent_label.bind("<KeyRelease>", self.mark_profile_unsaved)
-
-            # LED Indicator Canvas
-            led = LEDIndicator(self.grid_container, size=20, color=theme.led("idle"))
-            led.grid(row=row, column=3, padx=3, pady=3)
-
-            # Status Label
-            lbl_status = ctk.CTkLabel(self.grid_container, text="Run Scan First", text_color="#888888", font=("Segoe UI", 19))
-            lbl_status.grid(row=row, column=4, padx=3, pady=3, sticky="w")
-
-            # Live TEC state field (read-only entry)
-            ent_live_tec = ctk.CTkEntry(self.grid_container, width=88, state="disabled", font=("Segoe UI", 14, "bold"), justify="center",
-                                       fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-            set_entry_val(ent_live_tec, "OFF")
-            ent_live_tec.grid(row=row, column=5, padx=3, pady=3)
-
-            # Live LAS state field (read-only entry)
-            ent_live_las = ctk.CTkEntry(self.grid_container, width=88, state="disabled", font=("Segoe UI", 14, "bold"), justify="center",
-                                       fg_color=("#e0e0e0", "#3a3a3a"), text_color=("black", "#888888"))
-            set_entry_val(ent_live_las, "OFF")
-            ent_live_las.grid(row=row, column=6, padx=3, pady=3)
-
-            # Live Temp Readout
-            ent_live_t = ctk.CTkEntry(self.grid_container, width=102, state="disabled", font=("Segoe UI", 19), justify="right")
-            set_entry_val(ent_live_t, "0.0")
-            ent_live_t.grid(row=row, column=7, padx=3, pady=3)
-
-            # Live Current Readout
-            ent_live_i = ctk.CTkEntry(self.grid_container, width=102, state="disabled", font=("Segoe UI", 19), justify="right")
-            set_entry_val(ent_live_i, "0.0")
-            ent_live_i.grid(row=row, column=8, padx=3, pady=3)
-
-            # Target TEC Dropdown
-            opt_tec = ctk.CTkOptionMenu(self.grid_container, values=["ON", "OFF"], width=102, state="disabled", command=self.mark_profile_unsaved)
-            opt_tec.set("OFF")
-            opt_tec.grid(row=row, column=9, padx=3, pady=3)
-
-            # Target LAS Dropdown
-            opt_las = ctk.CTkOptionMenu(self.grid_container, values=["ON", "OFF"], width=102, state="disabled", command=self.mark_profile_unsaved)
-            opt_las.set("OFF")
-            opt_las.grid(row=row, column=10, padx=3, pady=3)
-
-            # Target Temp Entry
-            ent_target_t = ctk.CTkEntry(self.grid_container, width=102, state="disabled", justify="right")
-            ent_target_t.insert(0, "22.0")
-            ent_target_t.grid(row=row, column=11, padx=3, pady=3)
-            ent_target_t.bind("<KeyRelease>", self.mark_profile_unsaved)
-            ent_target_t.bind("<FocusOut>", lambda e, w=ent_target_t: self._validate_numeric_entry(w))
-
-            # Max Temp Limit Label
-            lbl_max_t = ctk.CTkLabel(self.grid_container, text="-", text_color="#666666", font=("Segoe UI", 19))
-            lbl_max_t.grid(row=row, column=12, padx=3, pady=3)
-
-            # Target Current Entry
-            ent_target_i = ctk.CTkEntry(self.grid_container, width=102, state="disabled", justify="right")
-            ent_target_i.insert(0, "0.0")
-            ent_target_i.grid(row=row, column=13, padx=3, pady=3)
-            ent_target_i.bind("<KeyRelease>", self.mark_profile_unsaved)
-            ent_target_i.bind("<FocusOut>", lambda e, w=ent_target_i: self._validate_numeric_entry(w))
-
-            # Max Current Limit Label
-            lbl_max_i = ctk.CTkLabel(self.grid_container, text="-", text_color="#666666", font=("Segoe UI", 19))
-            lbl_max_i.grid(row=row, column=14, padx=3, pady=3)
-
-            # Run Channel Button
-            btn_run_ch = ctk.CTkButton(self.grid_container, text="▶ Run Ch.", width=108, state="disabled", 
-                                       command=lambda ch=ch_idx: self.execute_single_channel(ch))
-            btn_run_ch.grid(row=row, column=15, padx=3, pady=3)
-
-            # Store mapping reference
-            self.ch_ui.append({
-                'label_num': lbl_ch,
-                'enable_var': var_enable,
-                'enable_chk': chk_enable,
-                'laser_label': ent_label,
-                'led': led,
-                'status': lbl_status,
-                'live_tec': ent_live_tec,
-                'live_las': ent_live_las,
-                'cur_t': ent_live_t,
-                'cur_i': ent_live_i,
-                'tec_cmd': opt_tec,
-                'las_cmd': opt_las,
-                't_target': ent_target_t,
-                't_lim': lbl_max_t,
-                'i_target': ent_target_i,
-                'i_lim': lbl_max_i,
-                'btn_exec': btn_run_ch
-            })
-
-        # Global overrides row layout under grid
-        master_row_1 = self.num_channels + 1
-        master_row_2 = self.num_channels + 2
-        self.grid_container.grid_rowconfigure(master_row_1, weight=1)
-        self.grid_container.grid_rowconfigure(master_row_2, weight=1)
-
-        # Master All ON/OFF aligned with live readouts
-        self.btn_master_on = ctk.CTkButton(self.grid_container, text="MASTER All ON", font=("Segoe UI", 14, "bold"),
-                                            fg_color="#2e7d32", hover_color="#1b5e20", text_color="white",
-                                            state="disabled", command=lambda: self.set_all_systems("ON"))
-        self.btn_master_on.grid(row=master_row_1, column=7, columnspan=2, padx=3, pady=3, sticky="ew")
-
-        self.btn_master_off = ctk.CTkButton(self.grid_container, text="MASTER All OFF", font=("Segoe UI", 14, "bold"),
-                                             fg_color="#c62828", hover_color="#b71c1c", text_color="white",
-                                             state="disabled", command=lambda: self.set_all_systems("OFF"))
-        self.btn_master_off.grid(row=master_row_2, column=7, columnspan=2, padx=3, pady=3, sticky="ew")
-
-        # TEC All ON/OFF aligned under Target TEC
-        self.btn_tec_on = ctk.CTkButton(self.grid_container, text="TEC All ON", font=("Segoe UI", 13, "bold"),
-                                         fg_color="#2e7d32", hover_color="#1b5e20", text_color="white",
-                                         state="disabled", command=lambda: self.set_all_dropdowns("TEC", "ON"))
-        self.btn_tec_on.grid(row=master_row_1, column=9, padx=3, pady=3, sticky="ew")
-
-        self.btn_tec_off = ctk.CTkButton(self.grid_container, text="TEC All OFF", font=("Segoe UI", 13, "bold"),
-                                          fg_color="#c62828", hover_color="#b71c1c", text_color="white",
-                                          state="disabled", command=lambda: self.set_all_dropdowns("TEC", "OFF"))
-        self.btn_tec_off.grid(row=master_row_2, column=9, padx=3, pady=3, sticky="ew")
-
-        # LAS All ON/OFF aligned under Target LAS
-        self.btn_las_on = ctk.CTkButton(self.grid_container, text="LAS All ON", font=("Segoe UI", 13, "bold"),
-                                         fg_color="#2e7d32", hover_color="#1b5e20", text_color="white",
-                                         state="disabled", command=lambda: self.set_all_dropdowns("LAS", "ON"))
-        self.btn_las_on.grid(row=master_row_1, column=10, padx=3, pady=3, sticky="ew")
-
-        self.btn_las_off = ctk.CTkButton(self.grid_container, text="LAS All OFF", font=("Segoe UI", 13, "bold"),
-                                          fg_color="#c62828", hover_color="#b71c1c", text_color="white",
-                                          state="disabled", command=lambda: self.set_all_dropdowns("LAS", "OFF"))
-        self.btn_las_off.grid(row=master_row_2, column=10, padx=3, pady=3, sticky="ew")
-
+        # Reflow on window resize; prime once geometry settles.
+        self.bind("<Configure>", self._reflow_cards)
+        self.after(60, lambda: self._reflow_cards(force=True))
 
         # ----------------------------------------------------
         # 3. BOTTOM PANEL: PARAMETERS & UTILITIES
@@ -539,6 +418,162 @@ class LDCControllerApp(ctk.CTk):
         self.btn_emerg = ctk.CTkButton(bot_panel, text="⚠\nEMO\nOFF", font=("Segoe UI", 13, "bold"), fg_color="#c62828", hover_color="#b71c1c",
                                         text_color="white", state="disabled", width=81, command=self.emergency_las_off)
         self.btn_emerg.grid(row=0, column=5, rowspan=3, padx=10, pady=10, sticky="nsew")
+
+    # ----------------------------------------------------
+    # CHANNEL CARD LAYOUT (responsive reflow)
+    # ----------------------------------------------------
+    def _build_channel_card(self, i):
+        """Create one channel's card. Returns the ch_ui dict with the SAME keys the
+        scan/telemetry/sequence code expects, plus 'card' (the frame itself)."""
+        ch_idx = i + 1
+        card = ctk.CTkFrame(self.cards_container, corner_radius=10, border_width=1,
+                            border_color=("#d0d0d0", "#3f3f3f"))
+        for c in range(4):
+            card.grid_columnconfigure(c, weight=1, uniform="cardcol")
+
+        muted = theme.status("muted")
+
+        def caption(text, col, row):
+            ctk.CTkLabel(card, text=text, font=("Segoe UI", 11), text_color=muted).grid(
+                row=row, column=col, padx=2, pady=(6, 0), sticky="s")
+
+        # Header: channel number, label, enable
+        lbl_ch = ctk.CTkLabel(card, text=f"Ch {ch_idx}", font=("Segoe UI", 15, "bold"))
+        lbl_ch.grid(row=0, column=0, padx=(10, 4), pady=(8, 2), sticky="w")
+
+        ent_label = ctk.CTkEntry(card, placeholder_text=f"Laser {ch_idx}", state="disabled")
+        ent_label.insert(0, f"Laser {ch_idx}")
+        ent_label.grid(row=0, column=1, columnspan=2, padx=4, pady=(8, 2), sticky="ew")
+        ent_label.bind("<KeyRelease>", self.mark_profile_unsaved)
+
+        var_enable = tk.BooleanVar(value=False)
+        chk_enable = ctk.CTkCheckBox(card, text="", width=24, variable=var_enable,
+                                     state="disabled", command=self._on_enable_toggle)
+        chk_enable.grid(row=0, column=3, padx=(4, 10), pady=(8, 2), sticky="e")
+
+        # Status row: LED + status text
+        led = LEDIndicator(card, size=18, color=theme.led("idle"))
+        led.grid(row=1, column=0, padx=(10, 4), pady=2, sticky="w")
+        lbl_status = ctk.CTkLabel(card, text="Run Scan First", text_color=muted,
+                                  font=("Segoe UI", 14), anchor="w")
+        lbl_status.grid(row=1, column=1, columnspan=3, padx=4, pady=2, sticky="ew")
+
+        # Live readouts
+        caption("Live TEC", 0, 2); caption("Live LAS", 1, 2)
+        caption("Live T °C", 2, 2); caption("Live I mA", 3, 2)
+        ent_live_tec = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 13, "bold"),
+                                    justify="center", fg_color=theme.LIVE_IDLE_BG, text_color=theme.LIVE_IDLE_TEXT)
+        set_entry_val(ent_live_tec, "OFF"); ent_live_tec.grid(row=3, column=0, padx=2, pady=2, sticky="ew")
+        ent_live_las = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 13, "bold"),
+                                    justify="center", fg_color=theme.LIVE_IDLE_BG, text_color=theme.LIVE_IDLE_TEXT)
+        set_entry_val(ent_live_las, "OFF"); ent_live_las.grid(row=3, column=1, padx=2, pady=2, sticky="ew")
+        ent_live_t = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 16), justify="right")
+        set_entry_val(ent_live_t, "0.0"); ent_live_t.grid(row=3, column=2, padx=2, pady=2, sticky="ew")
+        ent_live_i = ctk.CTkEntry(card, width=72, state="disabled", font=("Segoe UI", 16), justify="right")
+        set_entry_val(ent_live_i, "0.0"); ent_live_i.grid(row=3, column=3, padx=2, pady=2, sticky="ew")
+
+        # Target controls
+        caption("TEC", 0, 4); caption("LAS", 1, 4)
+        caption("Target T", 2, 4); caption("Target I", 3, 4)
+        opt_tec = ctk.CTkOptionMenu(card, values=["ON", "OFF"], width=72, state="disabled",
+                                    command=self.mark_profile_unsaved)
+        opt_tec.set("OFF"); opt_tec.grid(row=5, column=0, padx=2, pady=2, sticky="ew")
+        opt_las = ctk.CTkOptionMenu(card, values=["ON", "OFF"], width=72, state="disabled",
+                                    command=self.mark_profile_unsaved)
+        opt_las.set("OFF"); opt_las.grid(row=5, column=1, padx=2, pady=2, sticky="ew")
+        ent_target_t = ctk.CTkEntry(card, width=72, state="disabled", justify="right")
+        ent_target_t.insert(0, "22.0"); ent_target_t.grid(row=5, column=2, padx=2, pady=2, sticky="ew")
+        ent_target_t.bind("<KeyRelease>", self.mark_profile_unsaved)
+        ent_target_t.bind("<FocusOut>", lambda e, w=ent_target_t: self._validate_numeric_entry(w))
+        ent_target_i = ctk.CTkEntry(card, width=72, state="disabled", justify="right")
+        ent_target_i.insert(0, "0.0"); ent_target_i.grid(row=5, column=3, padx=2, pady=2, sticky="ew")
+        ent_target_i.bind("<KeyRelease>", self.mark_profile_unsaved)
+        ent_target_i.bind("<FocusOut>", lambda e, w=ent_target_i: self._validate_numeric_entry(w))
+
+        # Hardware limits
+        ctk.CTkLabel(card, text="Max limit:", font=("Segoe UI", 11), text_color=muted).grid(
+            row=6, column=1, padx=2, pady=(0, 2), sticky="e")
+        lbl_max_t = ctk.CTkLabel(card, text="-", font=("Segoe UI", 13), text_color=muted)
+        lbl_max_t.grid(row=6, column=2, padx=2, pady=(0, 2))
+        lbl_max_i = ctk.CTkLabel(card, text="-", font=("Segoe UI", 13), text_color=muted)
+        lbl_max_i.grid(row=6, column=3, padx=2, pady=(0, 2))
+
+        # Run button
+        btn_run_ch = ctk.CTkButton(card, text="▶ Run Ch.", state="disabled",
+                                   command=lambda ch=ch_idx: self.execute_single_channel(ch))
+        btn_run_ch.grid(row=7, column=0, columnspan=4, padx=10, pady=(6, 10), sticky="ew")
+
+        return {
+            'card': card,
+            'label_num': lbl_ch,
+            'enable_var': var_enable,
+            'enable_chk': chk_enable,
+            'laser_label': ent_label,
+            'led': led,
+            'status': lbl_status,
+            'live_tec': ent_live_tec,
+            'live_las': ent_live_las,
+            'cur_t': ent_live_t,
+            'cur_i': ent_live_i,
+            'tec_cmd': opt_tec,
+            'las_cmd': opt_las,
+            't_target': ent_target_t,
+            't_lim': lbl_max_t,
+            'i_target': ent_target_i,
+            'i_lim': lbl_max_i,
+            'btn_exec': btn_run_ch,
+        }
+
+    def _shown_indices(self):
+        """Which channel cards should be visible right now. Before the first scan,
+        or when 'Show unused' is on, show all. Otherwise show only populated +
+        enabled channels (hiding empty slots, no-laser cards, and disabled ones)."""
+        if self.show_unused_var.get() or not self._has_scanned:
+            return list(range(self.num_channels))
+        return [i for i in range(self.num_channels)
+                if self.ch_populated[i] and self.ch_ui[i]['enable_var'].get()]
+
+    def _reflow_cards(self, event=None, force=False):
+        """Grid the visible channel cards into as many columns as fit the current
+        width, so the layout reflows from a wide row down to a single column on a
+        laptop or quarter-screen window."""
+        if not getattr(self, "ch_ui", None):
+            return
+        # Use the scrollable frame's VIEWPORT width (its canvas). winfo_width is in
+        # physical pixels, but CTk widget widths are in logical units, so convert
+        # by the widget scaling factor (HiDPI displays scale by >1) before
+        # comparing to CARD_W.
+        canvas = getattr(self.cards_container, "_parent_canvas", None)
+        px_width = canvas.winfo_width() if canvas is not None else self.cards_container.winfo_width()
+        if px_width <= 1:
+            self.after(100, lambda: self._reflow_cards(force=True))
+            return
+        try:
+            scaling = ctk.ScalingTracker.get_widget_scaling(self.cards_container)
+        except Exception:
+            scaling = 1.0
+        width = px_width / max(scaling, 0.1)
+
+        CARD_W = 360   # logical units; approx one card's width incl. padding
+        shown = self._shown_indices()
+        cols = max(1, min(int(width // CARD_W), max(1, len(shown))))
+
+        key = (cols, tuple(shown))
+        if not force and key == self._reflow_key:
+            return
+        self._reflow_key = key
+
+        for c in range(self.num_channels):
+            self.cards_container.grid_columnconfigure(c, weight=(1 if c < cols else 0), uniform="cards")
+        for i in range(self.num_channels):
+            self.ch_ui[i]['card'].grid_forget()
+        for pos, i in enumerate(shown):
+            r, c = divmod(pos, cols)
+            self.ch_ui[i]['card'].grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+
+    def _on_enable_toggle(self):
+        """User toggled a channel's Enable box: re-evaluate card visibility."""
+        self._reflow_cards(force=True)
 
     # ----------------------------------------------------
     # INPUT VALIDATION HELPERS
@@ -789,6 +824,10 @@ class LDCControllerApp(ctk.CTk):
         for idx in range(self.num_channels):
             self.mark_empty(idx, "Disconnected")
 
+        # Nothing is known to be populated anymore; show every card again.
+        self._has_scanned = False
+        self._reflow_cards(force=True)
+
 
     # ----------------------------------------------------
     # CHASSIS INTERROGATOR (SCAN CHANNELS)
@@ -921,6 +960,7 @@ class LDCControllerApp(ctk.CTk):
 
     def update_channel_after_scan(self, idx, t_val, i_val, tec_out, las_out, max_t, max_i, has_hw_err, hw_err_str):
         ch = self.ch_ui[idx]
+        self.ch_populated[idx] = True   # a laser card responded here
         ch["enable_chk"].configure(state="normal")
         ch["enable_var"].set(True)
         ch["laser_label"].configure(state="normal")
@@ -985,6 +1025,10 @@ class LDCControllerApp(ctk.CTk):
         else:
             self.status_label.configure(text="Status: Scan Complete & Matched", text_color="#2e7d32")
 
+        # We now know which slots are populated, so the "unused" filter can apply.
+        self._has_scanned = True
+        self._reflow_cards(force=True)
+
         self.lock_ui("normal")
         self.btn_connect.configure(state="normal")
 
@@ -996,6 +1040,7 @@ class LDCControllerApp(ctk.CTk):
 
     def mark_empty(self, idx, reason):
         ch = self.ch_ui[idx]
+        self.ch_populated[idx] = False   # empty slot / no laser / disconnected
         ch["enable_chk"].configure(state="disabled")
         ch["enable_var"].set(False)
         ch["laser_label"].configure(state="disabled")
