@@ -589,13 +589,6 @@ class LDCMainWindow(QMainWindow):
             "All lasers at once: ramp every channel simultaneously (fastest).")
         self.mode_combo.currentIndexChanged.connect(self._mark_unsaved)
         run_col.addWidget(self.mode_combo)
-        # Prominent, always-visible estimate for the selected mode (the per-mode
-        # figures are also in each dropdown item for comparison).
-        self.lbl_eta = QLabel("Est. run time: — (scan & set targets)")
-        self.lbl_eta.setObjectName("hdr")
-        self.lbl_eta.setToolTip("Approximate time to complete the run in the selected mode. "
-                                "Populates after a scan once channels have targets.")
-        run_col.addWidget(self.lbl_eta)
         self.btn_run_all = QPushButton("▶ RUN ALL"); self.btn_run_all.setEnabled(False)
         self.btn_run_all.setMinimumHeight(48); self.btn_run_all.setMinimumWidth(280)
         self.btn_run_all.setStyleSheet("background:#2e7d32; color:white; font-size:16px; font-weight:bold; border-radius:8px;")
@@ -1083,12 +1076,6 @@ class LDCMainWindow(QMainWindow):
                 self.mode_combo.setItemText(idx, f"{names[idx]}  (~{int(secs // 60)}:{int(secs % 60):02d})")
             else:
                 self.mode_combo.setItemText(idx, names[idx])
-        if hasattr(self, "lbl_eta"):
-            if est:
-                secs = est[self._MODE_KEYS[self.mode_combo.currentIndex()]]
-                self.lbl_eta.setText(f"Est. run time: ~{int(secs // 60)}:{int(secs % 60):02d}")
-            else:
-                self.lbl_eta.setText("Est. run time: — (scan & set targets)")
 
     def _run_sequence(self, plans, t_ramp, i_ramp, t_off, mode):
         self.sequence_start_time = time.time()
