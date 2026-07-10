@@ -109,16 +109,6 @@ def build_stylesheet(dark):
     QLineEdit:focus, QComboBox:focus {{ border-color: #1976D2; }}
     QLineEdit:disabled, QComboBox:disabled {{ color: {muted}; }}
     QLineEdit[invalid="true"] {{ border: 1px solid #e53935; }}
-    QComboBox::drop-down {{
-        subcontrol-origin: padding; subcontrol-position: center right;
-        width: 18px; border-left: 1px solid {field_border};
-        border-top-right-radius: 6px; border-bottom-right-radius: 6px;
-    }}
-    QComboBox::down-arrow {{
-        width: 0; height: 0; margin-right: 4px;
-        border-left: 4px solid transparent; border-right: 4px solid transparent;
-        border-top: 5px solid {muted};
-    }}
     /* Dropdown popup: keep hovered/selected items readable (was white-on-white). */
     QComboBox QAbstractItemView {{
         background: {field_bg};
@@ -208,14 +198,18 @@ class QtSequenceEvents(SequenceEvents):
         self.b.fault.emit(idx, message)
 
 
-# Table-mode column spec: (title, fixed width). Column 4 (Status) stretches; all
-# other columns are pinned to these widths in BOTH the header and every row so the
-# labels line up with the data. STATUS_COL is the stretch column.
+# Table-mode column spec: (title, fixed width, header alignment). Column 4
+# (Status) stretches; all other columns are pinned to these widths in BOTH the
+# header and every row so the labels line up with the data, and the header text
+# is aligned to match each column's content.
+_AL = Qt.AlignLeft | Qt.AlignVCenter
+_AC = Qt.AlignCenter
+_AR = Qt.AlignRight | Qt.AlignVCenter
 TABLE_COLS = [
-    ("Ch", 42), ("On", 30), ("Label", 120), ("", 22), ("Status", 150),
-    ("Live TEC", 60), ("Live LAS", 60), ("Live T", 58), ("Live I", 58),
-    ("Tgt TEC", 70), ("Tgt LAS", 70), ("Tgt T", 58), ("Max T", 42),
-    ("Tgt I", 58), ("Max I", 42), ("Run", 96),
+    ("Ch", 46, _AL), ("On", 34, _AC), ("Label", 124, _AL), ("", 22, _AC), ("Status", 150, _AL),
+    ("Live TEC", 64, _AC), ("Live LAS", 64, _AC), ("Live T", 62, _AR), ("Live I", 62, _AR),
+    ("Tgt TEC", 74, _AL), ("Tgt LAS", 74, _AL), ("Tgt T", 62, _AL), ("Max T", 46, _AC),
+    ("Tgt I", 62, _AL), ("Max I", 46, _AC), ("Run", 98, _AC),
 ]
 STATUS_COL = 4
 
@@ -285,6 +279,7 @@ class ChannelCard(QFrame):
 
     def set_table_mode(self):
         self._clear()
+        self._grid.setHorizontalSpacing(10)
         for c in self._caps:
             c.setVisible(False)
         g = self._grid
@@ -294,11 +289,9 @@ class ChannelCard(QFrame):
                  self.tec_cmd, self.las_cmd, self.t_target, self.max_t,
                  self.i_target, self.max_i, self.run]
         small = {self.enable, self.led}
-        for c, (w, (_, width)) in enumerate(zip(order, TABLE_COLS)):
+        for c, (w, (_, width, _align)) in enumerate(zip(order, TABLE_COLS)):
             self._grid.setColumnMinimumWidth(c, width)
-            if c == STATUS_COL:
-                w.setMinimumWidth(0); w.setMaximumWidth(16777215)
-            elif w in small:
+            if c == STATUS_COL or w in small:
                 w.setMinimumWidth(0); w.setMaximumWidth(16777215)
             else:
                 w.setFixedWidth(width)
@@ -310,6 +303,7 @@ class ChannelCard(QFrame):
 
     def set_card_mode(self):
         self._clear()
+        self._grid.setHorizontalSpacing(6)
         # Restore natural sizing (table mode pins widths).
         for w in (self.num, self.label, self.live_tec, self.live_las, self.live_t,
                   self.live_i, self.tec_cmd, self.las_cmd, self.t_target,
@@ -465,8 +459,11 @@ class LDCMainWindow(QMainWindow):
         # --- Bottom panel: [ params + profile stacked ] ... [ presets | EMO | Run ] ---
         bottom = QHBoxLayout(); bottom.setSpacing(16)
 
-        # Left column: params row, then the profile row directly beneath it.
-        left = QVBoxLayout(); left.setSpacing(6)
+        # Left column: params row, then the profile row directly beneath it. A
+        # stretch above and below centers the pair vertically against the taller
+        # presets/Run block on the right (no lopsided gap under the profile row).
+        left = QVBoxLayout(); left.setSpacing(8)
+        left.addStretch(1)
         params = QHBoxLayout(); params.setSpacing(8)
 
         def add_param(label, attr, default):
@@ -526,9 +523,10 @@ class LDCMainWindow(QMainWindow):
         pv.addLayout(mgrid)
         bottom.addWidget(preset)
 
-        self.btn_emo = QPushButton("⚠ EMO OFF"); self.btn_emo.setEnabled(False)
-        self.btn_emo.setFixedWidth(104); self.btn_emo.setMinimumHeight(92)
-        self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; font-weight:bold; border-radius:8px;")
+        self.btn_emo = QPushButton("⚠  EMO OFF"); self.btn_emo.setEnabled(False)
+        self.btn_emo.setFixedWidth(140); self.btn_emo.setMinimumHeight(92)
+        self.btn_emo.setStyleSheet("background:#b71c1c; color:white; font-size:14px; "
+                                   "font-weight:bold; border-radius:8px; padding:6px 8px;")
         self.btn_emo.clicked.connect(self.emergency_las_off)
         bottom.addWidget(self.btn_emo)
 
@@ -549,10 +547,13 @@ class LDCMainWindow(QMainWindow):
 
     def _build_table_header(self):
         h = QFrame(); h.setObjectName("tableHeader")
-        g = QGridLayout(h); g.setContentsMargins(10, 4, 10, 4); g.setHorizontalSpacing(6)
-        for c, (title, w) in enumerate(TABLE_COLS):
+        # Margins + spacing must match ChannelCard's table-mode grid so the header
+        # columns line up exactly with the row columns.
+        g = QGridLayout(h); g.setContentsMargins(10, 4, 10, 4); g.setHorizontalSpacing(10)
+        for c, (title, w, align) in enumerate(TABLE_COLS):
             g.setColumnMinimumWidth(c, w)
             lab = QLabel(title); lab.setObjectName("caption")
+            lab.setAlignment(align)
             if c != STATUS_COL:
                 lab.setFixedWidth(w)   # match the row widgets so labels line up
             g.addWidget(lab, 0, c)
