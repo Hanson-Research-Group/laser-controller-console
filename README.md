@@ -11,8 +11,9 @@ A graphical desktop **control console for laser diode controllers** — the inst
 > - **Thorlabs ITC** series and **Wavelength Electronics TC / QCL** LAB instruments — included as **sim-backed driver stubs** (their command strings and USB/VISA backend are stubbed and marked for on-hardware validation). The architecture and UI support them today via the built-in simulator; finish and verify the command sets on the bench before connecting real hardware.
 >
 > The code is organized behind a device-agnostic driver + transport, so support for other controllers can be added without touching the GUI or the safety engine — see [Adding a controller](#-adding-another-controller).
->
-> <img width="3004" height="1780" alt="image" src="https://github.com/user-attachments/assets/1d4be68b-55e4-402f-a08e-a679cf028e62" />
+
+
+<img width="3004" height="1780" alt="image" src="https://github.com/user-attachments/assets/1d4be68b-55e4-402f-a08e-a679cf028e62" />
 
 ---
 
